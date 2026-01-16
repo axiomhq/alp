@@ -28,10 +28,9 @@ func (d *Decoder) Decode(block *EncodedBlock) []float64 {
 		exceptionIdx[pos] = i
 	}
 
-	// Pre-compute decode multipliers: FACT_ARR[factor] × FRAC_ARR[exp]
-	factMult := float64(float64FactArr[block.Factor])
-	fracMult := float64FracArr[block.Exp]
 	frameOfRef := block.FrameOfRef
+	exp := block.Exp
+	factor := block.Factor
 
 	// Decode each value
 	for i := 0; i < n; i++ {
@@ -41,9 +40,9 @@ func (d *Decoder) Decode(block *EncodedBlock) []float64 {
 			continue
 		}
 
-		// Add back frame of reference and decode
+		// Add back frame of reference and decode using canonical decodeValue
 		encoded := block.Encoded[i] + frameOfRef
-		result[i] = float64(encoded) * factMult * fracMult
+		result[i] = decodeValue(encoded, exp, factor)
 	}
 
 	return result
@@ -68,11 +67,9 @@ func (d *Decoder) DecodeVector(block *EncodedBlock, result []float64) {
 	copy(exceptionVals, block.Exceptions)
 	exceptionIdx := 0
 
-	// Pre-compute decode multipliers
-	factMult := float64(float64FactArr[block.Factor])
-	fracMult := float64FracArr[block.Exp]
-	decodeMult := factMult * fracMult
 	frameOfRef := block.FrameOfRef
+	exp := block.Exp
+	factor := block.Factor
 
 	// Process in chunks of 64 for cache efficiency
 	for chunk := 0; chunk < VectorSize/64; chunk++ {
@@ -84,7 +81,7 @@ func (d *Decoder) DecodeVector(block *EncodedBlock, result []float64) {
 			for i := 0; i < 64; i++ {
 				idx := baseIdx + i
 				encoded := block.Encoded[idx] + frameOfRef
-				result[idx] = float64(encoded) * decodeMult
+				result[idx] = decodeValue(encoded, exp, factor)
 			}
 		} else {
 			// Some exceptions - need to check each position
@@ -96,7 +93,7 @@ func (d *Decoder) DecodeVector(block *EncodedBlock, result []float64) {
 					exceptionIdx++
 				} else {
 					encoded := block.Encoded[idx] + frameOfRef
-					result[idx] = float64(encoded) * decodeMult
+					result[idx] = decodeValue(encoded, exp, factor)
 				}
 			}
 		}
@@ -119,11 +116,9 @@ func (d *Decoder) DecodeInPlace(block *EncodedBlock, result []float64) {
 		nextExcPos = int(block.ExceptionPos[0])
 	}
 
-	// Pre-compute decode multipliers
-	factMult := float64(float64FactArr[block.Factor])
-	fracMult := float64FracArr[block.Exp]
-	decodeMult := factMult * fracMult
 	frameOfRef := block.FrameOfRef
+	exp := block.Exp
+	factor := block.Factor
 
 	for i := 0; i < n; i++ {
 		if i == nextExcPos {
@@ -136,9 +131,9 @@ func (d *Decoder) DecodeInPlace(block *EncodedBlock, result []float64) {
 				nextExcPos = -1
 			}
 		} else {
-			// Regular decode
+			// Regular decode using canonical decodeValue
 			encoded := block.Encoded[i] + frameOfRef
-			result[i] = float64(encoded) * decodeMult
+			result[i] = decodeValue(encoded, exp, factor)
 		}
 	}
 }
@@ -152,9 +147,7 @@ func (d *Decoder) DecodeSingle(block *EncodedBlock, idx int) float64 {
 		}
 	}
 
-	// Regular decode
+	// Regular decode using canonical decodeValue
 	encoded := block.Encoded[idx] + block.FrameOfRef
-	factMult := float64(float64FactArr[block.Factor])
-	fracMult := float64FracArr[block.Exp]
-	return float64(encoded) * factMult * fracMult
+	return decodeValue(encoded, block.Exp, block.Factor)
 }

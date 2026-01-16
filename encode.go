@@ -243,9 +243,9 @@ func (e *Encoder) canEncode(v float64, exp, factor uint8) bool {
 		return false
 	}
 
-	// Decode and check if we get the original back
+	// Decode and check if we get the original back (bit-exact comparison)
 	decoded := decodeValue(encoded, exp, factor)
-	return decoded == v
+	return math.Float64bits(decoded) == math.Float64bits(v)
 }
 
 // encodeValue converts a float64 to an int64 using the given parameters.
@@ -357,11 +357,10 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	minVal := int64(math.MaxInt64)
 	maxVal := int64(math.MinInt64)
 
-	// Pre-compute encode/decode multipliers
+	// Pre-compute encode multiplier
 	// Encode: value × EXP_ARR[exp] × FRAC_ARR[factor]
 	encodeMult := float64ExpArr[e.exp] * float64FracArr[e.factor]
-	// Decode: encoded × FACT_ARR[factor] × FRAC_ARR[exp]
-	decodeMult := float64(float64FactArr[e.factor]) * float64FracArr[e.exp]
+	// For decode, we use decodeValue to ensure consistent floating-point operations
 
 	// Process in cache-friendly chunks of 8
 	for i := 0; i < VectorSize; i += 8 {
@@ -387,9 +386,10 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 				encoded = int64(scaled - 0.5)
 			}
 
-			// Verify roundtrip
-			decoded := float64(encoded) * decodeMult
-			if decoded != v || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
+			// Verify roundtrip (bit-exact comparison for lossless guarantee)
+			// Use decodeValue to ensure consistent floating-point operations
+			decoded := decodeValue(encoded, e.exp, e.factor)
+			if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
 				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
 				block.Exceptions = append(block.Exceptions, bits)
 				block.Encoded[idx] = 0

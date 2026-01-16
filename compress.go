@@ -1,6 +1,7 @@
 package alp
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"math"
@@ -679,6 +680,19 @@ func (cd *CompressedData) CompressedSize() int {
 	}
 
 	return size
+}
+
+// Bytes serializes compressed data to bytes.
+func (cd *CompressedData) Bytes() []byte {
+	var buf bytes.Buffer
+	cd.WriteTo(&buf)
+	return buf.Bytes()
+}
+
+// FromBytes deserializes compressed data from bytes.
+func (cd *CompressedData) FromBytes(data []byte) error {
+	_, err := cd.ReadFrom(bytes.NewReader(data))
+	return err
 }
 
 // VerifyLossless checks that compression is truly lossless.
