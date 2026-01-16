@@ -1,0 +1,434 @@
+package alp
+
+import (
+	"math"
+)
+
+// Encoder compresses float64 values using ALP encoding.
+type Encoder struct {
+	cfg Config
+
+	// Encoding state determined by sampling
+	exp    uint8 // Exponent index into float64ExpArr
+	factor uint8 // Factor index into float64FactArr
+	scheme Scheme
+}
+
+// NewEncoder creates a new ALP encoder with the given configuration.
+func NewEncoder(cfg Config) *Encoder {
+	return &Encoder{cfg: cfg}
+}
+
+// EncodedBlock holds the result of encoding a vector of floats.
+type EncodedBlock struct {
+	// Encoded integers after ALP transformation
+	Encoded []int64
+	// Frame-of-Reference base value
+	FrameOfRef int64
+	// Bit width needed for each value after FOR subtraction
+	BitWidth uint8
+	// Exception positions (indices of values that didn't roundtrip)
+	ExceptionPos []uint16
+	// Exception values (original float bits for exceptions)
+	Exceptions []uint64
+	// Encoding parameters
+	Exp    uint8
+	Factor uint8
+}
+
+// factorExponentPair represents a candidate encoding configuration.
+type factorExponentPair struct {
+	exp        uint8
+	factor     uint8
+	exceptions int
+}
+
+// Sample analyzes the data to find optimal encoding parameters.
+// This should be called once per row group before encoding vectors.
+func (e *Encoder) Sample(data []float64) {
+	if len(data) == 0 {
+		e.scheme = SchemeInvalid
+		return
+	}
+
+	// Sample data equidistantly
+	samples := e.sampleData(data)
+	if len(samples) == 0 {
+		e.scheme = SchemeALP
+		e.exp = 0
+		e.factor = 0
+		return
+	}
+
+	// Find best factor/exponent combinations
+	best := e.findBestCombination(samples)
+	e.exp = best.exp
+	e.factor = best.factor
+	e.scheme = SchemeALP
+}
+
+// sampleData extracts equidistant samples from the data.
+func (e *Encoder) sampleData(data []float64) []float64 {
+	n := len(data)
+	if n == 0 {
+		return nil
+	}
+
+	samplesPerVector := e.cfg.SamplesPerVector
+	if samplesPerVector <= 0 {
+		samplesPerVector = 32
+	}
+
+	// For small datasets, use all values as samples
+	if n <= samplesPerVector {
+		return append([]float64(nil), data...)
+	}
+
+	// Calculate how many vectors we have
+	numVectors := (n + VectorSize - 1) / VectorSize
+	if numVectors == 0 {
+		return append([]float64(nil), data...)
+	}
+
+	samples := make([]float64, 0, numVectors*samplesPerVector)
+
+	// Sample equidistantly from each vector
+	for v := 0; v < numVectors; v++ {
+		vecStart := v * VectorSize
+		vecEnd := vecStart + VectorSize
+		if vecEnd > n {
+			vecEnd = n
+		}
+		vecLen := vecEnd - vecStart
+
+		// For partial vectors, sample proportionally
+		samplesToTake := samplesPerVector
+		if vecLen < VectorSize {
+			samplesToTake = vecLen
+			if samplesToTake > samplesPerVector {
+				samplesToTake = samplesPerVector
+			}
+		}
+
+		// Sample equidistantly within this vector
+		step := vecLen / samplesToTake
+		if step == 0 {
+			step = 1
+		}
+
+		for i := 0; i < samplesToTake && vecStart+i*step < vecEnd; i++ {
+			samples = append(samples, data[vecStart+i*step])
+		}
+	}
+
+	if len(samples) == 0 {
+		return append([]float64(nil), data...)
+	}
+
+	return samples
+}
+
+// findBestCombination evaluates factor/exponent pairs to find the best one.
+// It considers both exception count and estimated bit width.
+// Reference: iterates exp from MAX to 0, factor from exp down to 0.
+func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
+	type combo struct {
+		exp        uint8
+		factor     uint8
+		exceptions int
+		bitWidth   int // estimated bit width
+		score      int // lower is better
+	}
+
+	var candidates []combo
+
+	// Try all valid (exp, factor) combinations where factor <= exp
+	// This matches the reference implementation's search space
+	for exp := uint8(0); exp <= float64MaxExponent; exp++ {
+		for factor := uint8(0); factor <= exp && int(factor) < len(float64FactArr); factor++ {
+			exceptions, minVal, maxVal := e.analyzeWithExpFactor(samples, exp, factor)
+
+			// Skip if too many exceptions
+			if exceptions > len(samples)/2 {
+				continue
+			}
+
+			// Estimate bit width from value range
+			var bitWidth int
+			if maxVal > minVal {
+				rng := uint64(maxVal - minVal)
+				bitWidth = bitsRequired(rng)
+			}
+
+			// Score: prioritize fewer exceptions, then lower bit width
+			// Each exception adds ~10 bytes overhead, each bit adds ~n/8 bytes
+			score := exceptions*80 + bitWidth*len(samples)/8
+
+			candidates = append(candidates, combo{
+				exp:        exp,
+				factor:     factor,
+				exceptions: exceptions,
+				bitWidth:   bitWidth,
+				score:      score,
+			})
+		}
+	}
+
+	// Find combination with lowest score
+	if len(candidates) == 0 {
+		return factorExponentPair{0, 0, len(samples)}
+	}
+
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.score < best.score {
+			best = c
+		}
+	}
+
+	return factorExponentPair{
+		exp:        best.exp,
+		factor:     best.factor,
+		exceptions: best.exceptions,
+	}
+}
+
+// analyzeWithExpFactor counts exceptions and finds min/max encoded values.
+func (e *Encoder) analyzeWithExpFactor(samples []float64, exp, factor uint8) (exceptions int, minVal, maxVal int64) {
+	minVal = int64(1<<62 - 1)
+	maxVal = int64(-1 << 62)
+
+	for _, v := range samples {
+		if !e.canEncode(v, exp, factor) {
+			exceptions++
+			continue
+		}
+
+		encoded := encodeValue(v, exp, factor)
+		if encoded < minVal {
+			minVal = encoded
+		}
+		if encoded > maxVal {
+			maxVal = encoded
+		}
+	}
+
+	return exceptions, minVal, maxVal
+}
+
+// countExceptions counts how many samples don't roundtrip correctly.
+func (e *Encoder) countExceptions(samples []float64, exp, factor uint8) int {
+	exceptions := 0
+	for _, v := range samples {
+		if !e.canEncode(v, exp, factor) {
+			exceptions++
+			// Early exit if too many exceptions
+			if exceptions > samplingEarlyExitThreshold {
+				return exceptions
+			}
+		}
+	}
+	return exceptions
+}
+
+// canEncode checks if a value can be encoded without loss.
+func (e *Encoder) canEncode(v float64, exp, factor uint8) bool {
+	if isSpecialFloat64(v) {
+		return false
+	}
+
+	// Encode the value
+	encoded := encodeValue(v, exp, factor)
+	if encoded < encodingLowerLimit || encoded > encodingUpperLimit {
+		return false
+	}
+
+	// Decode and check if we get the original back (bit-exact comparison)
+	decoded := decodeValue(encoded, exp, factor)
+	return math.Float64bits(decoded) == math.Float64bits(v)
+}
+
+// encodeValue converts a float64 to an int64 using the given parameters.
+// Reference formula: encoded = round(value × 10^exp × 10^(-factor)) = round(value × 10^(exp-factor))
+func encodeValue(v float64, exp, factor uint8) int64 {
+	// Multiply by 10^exp and divide by 10^factor (multiply by 10^-factor)
+	scaled := v * float64ExpArr[exp] * float64FracArr[factor]
+
+	// Fast rounding using magic number technique (Lemire-style)
+	// Adding 0.5 and truncating is equivalent to rounding for positive numbers
+	// For negative numbers, we subtract 0.5 instead
+	if scaled >= 0 {
+		return int64(scaled + 0.5)
+	}
+	return int64(scaled - 0.5)
+}
+
+// decodeValue converts an int64 back to a float64.
+// Reference formula: decoded = encoded × 10^factor × 10^(-exp) = encoded × 10^(factor-exp)
+func decodeValue(encoded int64, exp, factor uint8) float64 {
+	return float64(encoded) * float64(float64FactArr[factor]) * float64FracArr[exp]
+}
+
+// Encode compresses a vector of float64 values.
+func (e *Encoder) Encode(data []float64) *EncodedBlock {
+	n := len(data)
+	if n == 0 {
+		return &EncodedBlock{}
+	}
+
+	block := &EncodedBlock{
+		Encoded: make([]int64, n),
+		Exp:     e.exp,
+		Factor:  e.factor,
+	}
+
+	// First pass: encode all values and identify exceptions
+	minVal := int64(math.MaxInt64)
+	maxVal := int64(math.MinInt64)
+
+	for i, v := range data {
+		if isSpecialFloat64(v) || !e.canEncode(v, e.exp, e.factor) {
+			// Mark as exception
+			block.ExceptionPos = append(block.ExceptionPos, uint16(i))
+			block.Exceptions = append(block.Exceptions, math.Float64bits(v))
+			block.Encoded[i] = 0 // Placeholder
+			continue
+		}
+
+		encoded := encodeValue(v, e.exp, e.factor)
+		block.Encoded[i] = encoded
+
+		if encoded < minVal {
+			minVal = encoded
+		}
+		if encoded > maxVal {
+			maxVal = encoded
+		}
+	}
+
+	// Handle edge case where all values are exceptions
+	if len(block.ExceptionPos) == n {
+		block.FrameOfRef = 0
+		block.BitWidth = 0
+		return block
+	}
+
+	// Set frame of reference to minimum value
+	block.FrameOfRef = minVal
+
+	// Compute range and bit width
+	rng := uint64(maxVal - minVal)
+	block.BitWidth = uint8(bitsRequired(rng))
+
+	// Subtract frame of reference from all non-exception values
+	for i := range block.Encoded {
+		// Skip exceptions (they have placeholder values)
+		isException := false
+		for _, pos := range block.ExceptionPos {
+			if int(pos) == i {
+				isException = true
+				break
+			}
+		}
+		if !isException {
+			block.Encoded[i] -= minVal
+		}
+	}
+
+	return block
+}
+
+// EncodeVector encodes a vector of exactly VectorSize elements.
+// This is optimized for the common case of full vectors.
+func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
+	if len(data) != VectorSize {
+		return e.Encode(data)
+	}
+
+	block := &EncodedBlock{
+		Encoded:      make([]int64, VectorSize),
+		ExceptionPos: make([]uint16, 0, 8), // Preallocate for typical case
+		Exceptions:   make([]uint64, 0, 8),
+		Exp:          e.exp,
+		Factor:       e.factor,
+	}
+
+	// Vectorized encoding pass
+	minVal := int64(math.MaxInt64)
+	maxVal := int64(math.MinInt64)
+
+	// Pre-compute encode multiplier
+	// Encode: value × EXP_ARR[exp] × FRAC_ARR[factor]
+	encodeMult := float64ExpArr[e.exp] * float64FracArr[e.factor]
+	// For decode, we use decodeValue to ensure consistent floating-point operations
+
+	// Process in cache-friendly chunks of 8
+	for i := 0; i < VectorSize; i += 8 {
+		for j := 0; j < 8; j++ {
+			idx := i + j
+			v := data[idx]
+
+			// Fast path: check if value is special
+			bits := math.Float64bits(v)
+			if bits&float64ExponentMask == float64ExponentMask || bits == float64NegZeroBits {
+				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
+				block.Exceptions = append(block.Exceptions, bits)
+				block.Encoded[idx] = 0
+				continue
+			}
+
+			// Encode
+			scaled := v * encodeMult
+			var encoded int64
+			if scaled >= 0 {
+				encoded = int64(scaled + 0.5)
+			} else {
+				encoded = int64(scaled - 0.5)
+			}
+
+			// Verify roundtrip (bit-exact comparison for lossless guarantee)
+			// Use decodeValue to ensure consistent floating-point operations
+			decoded := decodeValue(encoded, e.exp, e.factor)
+			if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
+				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
+				block.Exceptions = append(block.Exceptions, bits)
+				block.Encoded[idx] = 0
+				continue
+			}
+
+			block.Encoded[idx] = encoded
+			if encoded < minVal {
+				minVal = encoded
+			}
+			if encoded > maxVal {
+				maxVal = encoded
+			}
+		}
+	}
+
+	// Handle all-exceptions case
+	if len(block.ExceptionPos) == VectorSize {
+		block.FrameOfRef = 0
+		block.BitWidth = 0
+		return block
+	}
+
+	block.FrameOfRef = minVal
+	rng := uint64(maxVal - minVal)
+	block.BitWidth = uint8(bitsRequired(rng))
+
+	// Create exception lookup for O(1) check
+	isException := make([]bool, VectorSize)
+	for _, pos := range block.ExceptionPos {
+		isException[pos] = true
+	}
+
+	// Subtract frame of reference
+	for i := 0; i < VectorSize; i++ {
+		if !isException[i] {
+			block.Encoded[i] -= minVal
+		}
+	}
+
+	return block
+}
