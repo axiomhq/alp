@@ -2,6 +2,20 @@ package alp
 
 import "math"
 
+// isSpecial returns true for NaN, Inf, or negative zero
+func isSpecial(bits uint64) bool {
+	exp := bits & 0x7FF0000000000000
+	return exp == 0x7FF0000000000000 || bits == 0x8000000000000000
+}
+
+// roundToInt64 rounds a float64 to the nearest int64
+func roundToInt64(v float64) int64 {
+	if v >= 0 {
+		return int64(v + 0.5)
+	}
+	return int64(v - 0.5)
+}
+
 // Sampling implements the paper's two-level sampling strategy:
 // 1. First level: sample values from the dataset to find top-K (exp, factor) pairs
 // 2. Second level: for each vector, test top-K pairs and pick the best
