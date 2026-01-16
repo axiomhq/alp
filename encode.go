@@ -130,6 +130,7 @@ func (e *Encoder) sampleData(data []float64) []float64 {
 
 // findBestCombination evaluates factor/exponent pairs to find the best one.
 // It considers both exception count and estimated bit width.
+// Reference: iterates exp from MAX to 0, factor from exp down to 0.
 func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 	type combo struct {
 		exp        uint8
@@ -141,33 +142,36 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 
 	var candidates []combo
 
-	// Try all valid exponents (factor is not used in current implementation)
+	// Try all valid (exp, factor) combinations where factor <= exp
+	// This matches the reference implementation's search space
 	for exp := uint8(0); exp <= float64MaxExponent; exp++ {
-		exceptions, minVal, maxVal := e.analyzeWithExp(samples, exp)
+		for factor := uint8(0); factor <= exp && int(factor) < len(float64FactArr); factor++ {
+			exceptions, minVal, maxVal := e.analyzeWithExpFactor(samples, exp, factor)
 
-		// Skip if too many exceptions
-		if exceptions > len(samples)/2 {
-			continue
+			// Skip if too many exceptions
+			if exceptions > len(samples)/2 {
+				continue
+			}
+
+			// Estimate bit width from value range
+			var bitWidth int
+			if maxVal > minVal {
+				rng := uint64(maxVal - minVal)
+				bitWidth = bitsRequired(rng)
+			}
+
+			// Score: prioritize fewer exceptions, then lower bit width
+			// Each exception adds ~10 bytes overhead, each bit adds ~n/8 bytes
+			score := exceptions*80 + bitWidth*len(samples)/8
+
+			candidates = append(candidates, combo{
+				exp:        exp,
+				factor:     factor,
+				exceptions: exceptions,
+				bitWidth:   bitWidth,
+				score:      score,
+			})
 		}
-
-		// Estimate bit width from value range
-		var bitWidth int
-		if maxVal > minVal {
-			rng := uint64(maxVal - minVal)
-			bitWidth = bitsRequired(rng)
-		}
-
-		// Score: prioritize fewer exceptions, then lower bit width
-		// Each exception adds ~10 bytes overhead, each bit adds ~n/8 bytes
-		score := exceptions*80 + bitWidth*len(samples)/8
-
-		candidates = append(candidates, combo{
-			exp:        exp,
-			factor:     exp, // factor equals exp for now
-			exceptions: exceptions,
-			bitWidth:   bitWidth,
-			score:      score,
-		})
 	}
 
 	// Find combination with lowest score
@@ -189,18 +193,18 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 	}
 }
 
-// analyzeWithExp counts exceptions and finds min/max encoded values.
-func (e *Encoder) analyzeWithExp(samples []float64, exp uint8) (exceptions int, minVal, maxVal int64) {
+// analyzeWithExpFactor counts exceptions and finds min/max encoded values.
+func (e *Encoder) analyzeWithExpFactor(samples []float64, exp, factor uint8) (exceptions int, minVal, maxVal int64) {
 	minVal = int64(1<<62 - 1)
 	maxVal = int64(-1 << 62)
 
 	for _, v := range samples {
-		if !e.canEncode(v, exp, exp) {
+		if !e.canEncode(v, exp, factor) {
 			exceptions++
 			continue
 		}
 
-		encoded := encodeValue(v, exp, exp)
+		encoded := encodeValue(v, exp, factor)
 		if encoded < minVal {
 			minVal = encoded
 		}
@@ -245,10 +249,10 @@ func (e *Encoder) canEncode(v float64, exp, factor uint8) bool {
 }
 
 // encodeValue converts a float64 to an int64 using the given parameters.
-// encoded = round(value * 10^exp)
+// Reference formula: encoded = round(value × 10^exp × 10^(-factor)) = round(value × 10^(exp-factor))
 func encodeValue(v float64, exp, factor uint8) int64 {
-	// Multiply by power of 10 and round to nearest integer
-	scaled := v * float64ExpArr[exp]
+	// Multiply by 10^exp and divide by 10^factor (multiply by 10^-factor)
+	scaled := v * float64ExpArr[exp] * float64FracArr[factor]
 
 	// Fast rounding using magic number technique (Lemire-style)
 	// Adding 0.5 and truncating is equivalent to rounding for positive numbers
@@ -260,9 +264,9 @@ func encodeValue(v float64, exp, factor uint8) int64 {
 }
 
 // decodeValue converts an int64 back to a float64.
-// decoded = encoded * 10^(-exp) * factor
+// Reference formula: decoded = encoded × 10^factor × 10^(-exp) = encoded × 10^(factor-exp)
 func decodeValue(encoded int64, exp, factor uint8) float64 {
-	return float64(encoded) * float64FracArr[exp]
+	return float64(encoded) * float64(float64FactArr[factor]) * float64FracArr[exp]
 }
 
 // Encode compresses a vector of float64 values.
@@ -352,8 +356,12 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	// Vectorized encoding pass
 	minVal := int64(math.MaxInt64)
 	maxVal := int64(math.MinInt64)
-	expMult := float64ExpArr[e.exp]
-	fracMult := float64FracArr[e.exp]
+
+	// Pre-compute encode/decode multipliers
+	// Encode: value × EXP_ARR[exp] × FRAC_ARR[factor]
+	encodeMult := float64ExpArr[e.exp] * float64FracArr[e.factor]
+	// Decode: encoded × FACT_ARR[factor] × FRAC_ARR[exp]
+	decodeMult := float64(float64FactArr[e.factor]) * float64FracArr[e.exp]
 
 	// Process in cache-friendly chunks of 8
 	for i := 0; i < VectorSize; i += 8 {
@@ -371,7 +379,7 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 			}
 
 			// Encode
-			scaled := v * expMult
+			scaled := v * encodeMult
 			var encoded int64
 			if scaled >= 0 {
 				encoded = int64(scaled + 0.5)
@@ -380,7 +388,7 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 			}
 
 			// Verify roundtrip
-			decoded := float64(encoded) * fracMult
+			decoded := float64(encoded) * decodeMult
 			if decoded != v || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
 				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
 				block.Exceptions = append(block.Exceptions, bits)
