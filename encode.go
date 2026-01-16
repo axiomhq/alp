@@ -129,29 +129,55 @@ func (e *Encoder) sampleData(data []float64) []float64 {
 }
 
 // findBestCombination evaluates factor/exponent pairs to find the best one.
+// It considers both exception count and estimated bit width.
 func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
-	// Track exception counts for each combination
 	type combo struct {
 		exp        uint8
 		factor     uint8
 		exceptions int
+		bitWidth   int // estimated bit width
+		score      int // lower is better
 	}
 
 	var candidates []combo
 
-	// Try all valid factor/exponent combinations
-	// Factor must be >= Exponent for valid encoding
+	// Try all valid exponents (factor is not used in current implementation)
 	for exp := uint8(0); exp <= float64MaxExponent; exp++ {
-		for factor := exp; factor <= float64MaxExponent && int(factor) < len(float64FactArr); factor++ {
-			exceptions := e.countExceptions(samples, exp, factor)
-			candidates = append(candidates, combo{exp, factor, exceptions})
+		exceptions, minVal, maxVal := e.analyzeWithExp(samples, exp)
+
+		// Skip if too many exceptions
+		if exceptions > len(samples)/2 {
+			continue
 		}
+
+		// Estimate bit width from value range
+		var bitWidth int
+		if maxVal > minVal {
+			rng := uint64(maxVal - minVal)
+			bitWidth = bitsRequired(rng)
+		}
+
+		// Score: prioritize fewer exceptions, then lower bit width
+		// Each exception adds ~10 bytes overhead, each bit adds ~n/8 bytes
+		score := exceptions*80 + bitWidth*len(samples)/8
+
+		candidates = append(candidates, combo{
+			exp:        exp,
+			factor:     exp, // factor equals exp for now
+			exceptions: exceptions,
+			bitWidth:   bitWidth,
+			score:      score,
+		})
 	}
 
-	// Find the combination with fewest exceptions
-	best := combo{0, 0, len(samples)}
-	for _, c := range candidates {
-		if c.exceptions < best.exceptions {
+	// Find combination with lowest score
+	if len(candidates) == 0 {
+		return factorExponentPair{0, 0, len(samples)}
+	}
+
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.score < best.score {
 			best = c
 		}
 	}
@@ -161,6 +187,29 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 		factor:     best.factor,
 		exceptions: best.exceptions,
 	}
+}
+
+// analyzeWithExp counts exceptions and finds min/max encoded values.
+func (e *Encoder) analyzeWithExp(samples []float64, exp uint8) (exceptions int, minVal, maxVal int64) {
+	minVal = int64(1<<62 - 1)
+	maxVal = int64(-1 << 62)
+
+	for _, v := range samples {
+		if !e.canEncode(v, exp, exp) {
+			exceptions++
+			continue
+		}
+
+		encoded := encodeValue(v, exp, exp)
+		if encoded < minVal {
+			minVal = encoded
+		}
+		if encoded > maxVal {
+			maxVal = encoded
+		}
+	}
+
+	return exceptions, minVal, maxVal
 }
 
 // countExceptions counts how many samples don't roundtrip correctly.

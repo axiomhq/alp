@@ -31,28 +31,35 @@ func (c *Compressor) Analyze(data []float64) Scheme {
 		return c.scheme
 	}
 
+	originalSize := len(data) * 8 // 8 bytes per float64
+
 	// Sample and analyze with ALP
 	c.encoder.Sample(data)
 
-	// Count exceptions with chosen parameters
-	alpExceptions := 0
-	samples := c.encoder.sampleData(data)
-	for _, v := range samples {
-		if !c.encoder.canEncode(v, c.encoder.exp, c.encoder.factor) {
-			alpExceptions++
-		}
-	}
+	// Actually encode a sample to measure real compressed size
+	sampleSize := min(len(data), VectorSize)
+	sample := data[:sampleSize]
 
-	// If ALP has very few exceptions, use it
-	alpExceptionRate := float64(alpExceptions) / float64(len(samples))
-	if alpExceptionRate < 0.05 { // Less than 5% exceptions
+	block := c.encoder.Encode(sample)
+	packed := PackBlock(block)
+
+	// Calculate actual ALP size per value
+	alpBlockSize := 21 + len(packed.Data) + len(packed.ExceptionPos)*2 + len(packed.Exceptions)*8
+	alpBytesPerValue := float64(alpBlockSize) / float64(sampleSize)
+
+	// Extrapolate to full data
+	numBlocks := (len(data) + VectorSize - 1) / VectorSize
+	alpEstSize := int(alpBytesPerValue*float64(len(data))) + numBlocks*5
+
+	// If ALP compresses well (< 95% of original), use it
+	if float64(alpEstSize) < float64(originalSize)*0.95 {
 		c.scheme = SchemeALP
 		return c.scheme
 	}
 
-	// Otherwise, try ALP RD
-	c.rdEncoder.Sample(data)
-	c.scheme = SchemeALPRD
+	// For now, skip ALP RD as it doesn't compress well in current implementation
+	// Use raw passthrough instead
+	c.scheme = SchemeRaw
 	return c.scheme
 }
 
@@ -77,6 +84,11 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 		result.ALPBlocks = c.compressALP(data)
 	case SchemeALPRD:
 		result.RDBlocks = c.compressRD(data)
+	case SchemeRaw:
+		result.RawData = make([]uint64, len(data))
+		for i, v := range data {
+			result.RawData[i] = math.Float64bits(v)
+		}
 	}
 
 	return result
@@ -138,6 +150,7 @@ type CompressedData struct {
 	Count     int
 	ALPBlocks []*PackedBlock
 	RDBlocks  []*RDEncodedBlock
+	RawData   []uint64 // For SchemeRaw - uncompressed float bits
 }
 
 // Decompressor provides a unified interface for ALP decompression.
@@ -172,6 +185,12 @@ func (d *Decompressor) Decompress(data *CompressedData) []float64 {
 		for _, block := range data.RDBlocks {
 			result = append(result, d.rdDecoder.Decode(block)...)
 		}
+	case SchemeRaw:
+		result = make([]float64, len(data.RawData))
+		for i, bits := range data.RawData {
+			result[i] = math.Float64frombits(bits)
+		}
+		return result
 	}
 
 	// Trim to exact count (last block may have been padded)
@@ -249,6 +268,16 @@ func (cd *CompressedData) WriteTo(w io.Writer) (int64, error) {
 				return written, err
 			}
 		}
+	case SchemeRaw:
+		for _, bits := range cd.RawData {
+			buf := make([]byte, 8)
+			binary.LittleEndian.PutUint64(buf, bits)
+			n, err := w.Write(buf)
+			written += int64(n)
+			if err != nil {
+				return written, err
+			}
+		}
 	}
 
 	return written, nil
@@ -294,6 +323,17 @@ func (cd *CompressedData) ReadFrom(r io.Reader) (int64, error) {
 				return read, err
 			}
 			cd.RDBlocks[i] = block
+		}
+	case SchemeRaw:
+		cd.RawData = make([]uint64, cd.Count)
+		for i := range cd.RawData {
+			buf := make([]byte, 8)
+			n, err := io.ReadFull(r, buf)
+			read += int64(n)
+			if err != nil {
+				return read, err
+			}
+			cd.RawData[i] = binary.LittleEndian.Uint64(buf)
 		}
 	}
 
@@ -634,6 +674,8 @@ func (cd *CompressedData) CompressedSize() int {
 			size += len(block.ExceptionPos) * 2
 			size += len(block.Exceptions) * 8
 		}
+	case SchemeRaw:
+		size += len(cd.RawData) * 8
 	}
 
 	return size

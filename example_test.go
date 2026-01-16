@@ -26,7 +26,7 @@ func Example() {
 	// Output:
 	// Original: [10.99 20.5 15.75 99.99 0.01 1234.56 7890.12 45.67]
 	// Decompressed: [10.99 20.5 15.75 99.99 0.01 1234.56 7890.12 45.67]
-	// Compression ratio: 1.23
+	// Compression ratio: 1.08
 }
 
 func ExampleCompressor() {

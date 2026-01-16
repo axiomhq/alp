@@ -25,6 +25,7 @@ const (
 	SchemeInvalid Scheme = iota
 	SchemeALP            // Standard ALP for decimal floats
 	SchemeALPRD          // ALP Real Doubles for high-precision floats
+	SchemeRaw            // Uncompressed (when compression would expand data)
 )
 
 // VectorSize is the number of elements processed in one vector.
