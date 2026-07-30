@@ -428,12 +428,14 @@ type PackedBlock struct {
 
 // PackBlock compresses an EncodedBlock into a PackedBlock.
 func PackBlock(block *EncodedBlock) *PackedBlock {
-	// Pack the values
-	packer := NewBitPacker(len(block.Encoded) * int(block.BitWidth+7) / 8)
-	packer.packInt64(block.Encoded, block.BitWidth)
+	var data []byte
+	if block.BitWidth != 0 && len(block.Encoded) != 0 {
+		data = make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
+		packFixedWidth(data, block.Encoded, block.BitWidth)
+	}
 
 	return &PackedBlock{
-		Data:         packer.Bytes(),
+		Data:         data,
 		Count:        len(block.Encoded),
 		FrameOfRef:   block.FrameOfRef,
 		BitWidth:     block.BitWidth,
@@ -461,16 +463,15 @@ func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
 		return PackBlock(block)
 	}
 
-	packer := NewBitPacker(len(block.Encoded) * int(block.BitWidth+7) / 8)
-	packer.grow(len(block.Encoded), block.BitWidth)
+	data := make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
 	if block.BitWidth == 10 {
-		packFixedWidth10Offset(packer.buf, block.Encoded, block.FrameOfRef)
+		packFixedWidth10Offset(data, block.Encoded, block.FrameOfRef)
 	} else {
-		packFixedWidth20Offset(packer.buf, block.Encoded, block.FrameOfRef)
+		packFixedWidth20Offset(data, block.Encoded, block.FrameOfRef)
 	}
 
 	return &PackedBlock{
-		Data:         packer.Bytes(),
+		Data:         data,
 		Count:        len(block.Encoded),
 		FrameOfRef:   block.FrameOfRef,
 		BitWidth:     block.BitWidth,
