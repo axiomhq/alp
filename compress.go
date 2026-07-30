@@ -53,7 +53,7 @@ func (c *Compressor) analyze(data []float64) (Scheme, *EncodedBlock) {
 	if sampleSize == VectorSize {
 		block = c.encodeVector(sample)
 	} else {
-		block = c.encoder.Encode(sample)
+		block = c.encodePartial(sample)
 	}
 
 	// Calculate actual ALP size per value
@@ -77,10 +77,20 @@ func (c *Compressor) analyze(data []float64) (Scheme, *EncodedBlock) {
 }
 
 func (c *Compressor) encodeVector(data []float64) *EncodedBlock {
-	if c.encodedScratch == nil {
+	if cap(c.encodedScratch) < VectorSize {
 		c.encodedScratch = make([]int64, VectorSize)
 	}
+	c.encodedScratch = c.encodedScratch[:VectorSize]
 	c.encoder.encodeVectorTo(data, c.encodedScratch, false, &c.encodedBlock)
+	return &c.encodedBlock
+}
+
+func (c *Compressor) encodePartial(data []float64) *EncodedBlock {
+	if cap(c.encodedScratch) < len(data) {
+		c.encodedScratch = make([]int64, len(data))
+	}
+	c.encodedScratch = c.encodedScratch[:len(data)]
+	c.encoder.encodeTo(data, c.encodedScratch, &c.encodedBlock)
 	return &c.encodedBlock
 }
 
@@ -150,7 +160,7 @@ func (c *Compressor) compressALP(data []float64, firstBlock *EncodedBlock) []*Pa
 		if end-i == VectorSize {
 			encoded = c.encodeVector(data[i:end])
 		} else {
-			encoded = c.encoder.Encode(data[i:end])
+			encoded = c.encodePartial(data[i:end])
 		}
 
 		if end-i == VectorSize {

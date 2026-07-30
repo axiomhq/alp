@@ -314,15 +314,19 @@ func decodeValue(encoded int64, exp, factor uint8) float64 {
 
 // Encode compresses a vector of float64 values.
 func (e *Encoder) Encode(data []float64) *EncodedBlock {
-	n := len(data)
-	if n == 0 {
-		return &EncodedBlock{}
-	}
+	block := new(EncodedBlock)
+	e.encodeTo(data, make([]int64, len(data)), block)
+	return block
+}
 
-	block := &EncodedBlock{
-		Encoded: make([]int64, n),
-		Exp:     e.exp,
-		Factor:  e.factor,
+func (e *Encoder) encodeTo(data []float64, encoded []int64, block *EncodedBlock) {
+	n := len(data)
+	encoded = encoded[:n]
+	var exceptionPos []uint16
+	var exceptions []uint64
+	if n == 0 {
+		*block = EncodedBlock{}
+		return
 	}
 
 	// First pass: encode all values and identify exceptions
@@ -335,54 +339,64 @@ func (e *Encoder) Encode(data []float64) *EncodedBlock {
 	for i, v := range data {
 		bits := math.Float64bits(v)
 		scaled := v * encodeMult
-		var encoded int64
+		var value int64
 		if scaled >= 0 {
-			encoded = int64(scaled + 0.5)
+			value = int64(scaled + 0.5)
 		} else {
-			encoded = int64(scaled - 0.5)
+			value = int64(scaled - 0.5)
 		}
 
-		decoded := float64(encoded) * factMult * fracMult
-		if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
-			block.ExceptionPos = append(block.ExceptionPos, uint16(i))
-			block.Exceptions = append(block.Exceptions, bits)
-			block.Encoded[i] = 0
+		decoded := float64(value) * factMult * fracMult
+		if math.Float64bits(decoded) != bits || value < encodingLowerLimit || value > encodingUpperLimit {
+			exceptionPos = append(exceptionPos, uint16(i))
+			exceptions = append(exceptions, bits)
+			encoded[i] = 0
 			continue
 		}
 
-		block.Encoded[i] = encoded
-		if encoded < minVal {
-			minVal = encoded
+		encoded[i] = value
+		if value < minVal {
+			minVal = value
 		}
-		if encoded > maxVal {
-			maxVal = encoded
+		if value > maxVal {
+			maxVal = value
 		}
 	}
 
 	// Handle edge case where all values are exceptions
-	if len(block.ExceptionPos) == n {
-		block.FrameOfRef = 0
-		block.BitWidth = 0
-		return block
+	if len(exceptionPos) == n {
+		*block = EncodedBlock{
+			Encoded:      encoded,
+			ExceptionPos: exceptionPos,
+			Exceptions:   exceptions,
+			Exp:          e.exp,
+			Factor:       e.factor,
+		}
+		return
 	}
-
-	// Set frame of reference to minimum value
-	block.FrameOfRef = minVal
 
 	// Compute range and bit width
 	rng := uint64(maxVal - minVal)
-	block.BitWidth = uint8(bitsRequired(rng))
+	bitWidth := uint8(bitsRequired(rng))
 
 	// Subtract the frame in one linear pass, then restore exception slots to
 	// their canonical zero placeholder.
-	for i := range block.Encoded {
-		block.Encoded[i] -= minVal
+	for i := range encoded {
+		encoded[i] -= minVal
 	}
-	for _, pos := range block.ExceptionPos {
-		block.Encoded[pos] = 0
+	for _, pos := range exceptionPos {
+		encoded[pos] = 0
 	}
 
-	return block
+	*block = EncodedBlock{
+		Encoded:      encoded,
+		FrameOfRef:   minVal,
+		BitWidth:     bitWidth,
+		ExceptionPos: exceptionPos,
+		Exceptions:   exceptions,
+		Exp:          e.exp,
+		Factor:       e.factor,
+	}
 }
 
 // EncodeVector encodes a vector of exactly VectorSize elements.
