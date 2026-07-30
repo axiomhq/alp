@@ -125,7 +125,11 @@ func (d *Decoder) decodePackedInto(block *PackedBlock, result []float64) int {
 			result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
 		}
 	case 10:
-		decodePacked10(block.Data, result[:n], frameOfRef, factMult, fracMult)
+		if block.Factor == 0 {
+			decodePacked10FactorZero(block.Data, result[:n], frameOfRef, fracMult)
+		} else {
+			decodePacked10(block.Data, result[:n], frameOfRef, factMult, fracMult)
+		}
 	case 16:
 		for i := 0; i < n; i++ {
 			value := binary.LittleEndian.Uint16(block.Data[i*2:])
@@ -197,6 +201,25 @@ func decodePacked10(data []byte, result []float64, frameOfRef int64, factMult, f
 		bytePos += 10
 	}
 	decodePackedRemainder(data[bytePos:], result[i:], 10, frameOfRef, factMult, fracMult)
+}
+
+func decodePacked10FactorZero(data []byte, result []float64, frameOfRef int64, fracMult float64) {
+	i := 0
+	bytePos := 0
+	for ; i+8 <= len(result); i += 8 {
+		lo := binary.LittleEndian.Uint64(data[bytePos : bytePos+8])
+		hi := uint64(binary.LittleEndian.Uint16(data[bytePos+8 : bytePos+10]))
+		result[i] = float64(int64(lo&0x3ff)+frameOfRef) * fracMult
+		result[i+1] = float64(int64((lo>>10)&0x3ff)+frameOfRef) * fracMult
+		result[i+2] = float64(int64((lo>>20)&0x3ff)+frameOfRef) * fracMult
+		result[i+3] = float64(int64((lo>>30)&0x3ff)+frameOfRef) * fracMult
+		result[i+4] = float64(int64((lo>>40)&0x3ff)+frameOfRef) * fracMult
+		result[i+5] = float64(int64((lo>>50)&0x3ff)+frameOfRef) * fracMult
+		result[i+6] = float64(int64((lo>>60|hi<<4)&0x3ff)+frameOfRef) * fracMult
+		result[i+7] = float64(int64((hi>>6)&0x3ff)+frameOfRef) * fracMult
+		bytePos += 10
+	}
+	decodePackedRemainder(data[bytePos:], result[i:], 10, frameOfRef, 1, fracMult)
 }
 
 func decodePacked20(data []byte, result []float64, frameOfRef int64, factMult, fracMult float64) {
