@@ -1,5 +1,7 @@
 package alp
 
+import "encoding/binary"
+
 // BitPacker packs integers into a bit stream using variable bit widths.
 // This implements Frame-of-Reference encoding where values are stored
 // relative to a minimum value using only the bits required.
@@ -22,20 +24,122 @@ func (p *BitPacker) Pack(values []uint64, bitWidth uint8) {
 		return
 	}
 
-	// Calculate bytes needed
-	totalBits := uint(len(values)) * uint(bitWidth)
-	bytesNeeded := (totalBits + 7) / 8
-
-	// Ensure we have enough space
-	startLen := len(p.buf)
-	for len(p.buf) < startLen+int(bytesNeeded) {
-		p.buf = append(p.buf, 0)
+	p.grow(len(values), bitWidth)
+	if p.bitPos == 0 {
+		packFixedWidth(p.buf, values, bitWidth)
+		p.bitPos = uint(len(values)) * uint(bitWidth)
+		return
 	}
 
 	// Pack each value
 	for _, v := range values {
 		p.packValue(v, bitWidth)
 	}
+}
+
+// packInt64 packs non-negative frame-of-reference values without first
+// copying them into a []uint64.
+func (p *BitPacker) packInt64(values []int64, bitWidth uint8) {
+	if bitWidth == 0 || len(values) == 0 {
+		return
+	}
+
+	p.grow(len(values), bitWidth)
+	if p.bitPos == 0 {
+		packFixedWidth(p.buf, values, bitWidth)
+		p.bitPos = uint(len(values)) * uint(bitWidth)
+		return
+	}
+	for _, v := range values {
+		p.packValue(uint64(v), bitWidth)
+	}
+}
+
+// packFixedWidth uses a 64-bit reservoir so the common one-shot path writes
+// eight bytes at a time instead of visiting every output byte separately.
+func packFixedWidth[T ~int64 | ~uint64](dst []byte, values []T, bitWidth uint8) {
+	switch bitWidth {
+	case 8:
+		for i, value := range values {
+			dst[i] = byte(value)
+		}
+		return
+	case 16:
+		for i, value := range values {
+			binary.LittleEndian.PutUint16(dst[i*2:], uint16(value))
+		}
+		return
+	case 32:
+		for i, value := range values {
+			binary.LittleEndian.PutUint32(dst[i*4:], uint32(value))
+		}
+		return
+	case 64:
+		for i, value := range values {
+			binary.LittleEndian.PutUint64(dst[i*8:], uint64(value))
+		}
+		return
+	}
+
+	width := uint(bitWidth)
+	mask := ^uint64(0)
+	if width < 64 {
+		mask = (uint64(1) << width) - 1
+	}
+
+	var reservoir uint64
+	var buffered uint
+	out := 0
+	for _, raw := range values {
+		value := uint64(raw) & mask
+		remaining := width
+		for remaining > 0 {
+			take := remaining
+			if space := 64 - buffered; take > space {
+				take = space
+			}
+
+			chunk := value
+			if take < 64 {
+				chunk &= (uint64(1) << take) - 1
+				value >>= take
+			} else {
+				value = 0
+			}
+			reservoir |= chunk << buffered
+			buffered += take
+			remaining -= take
+
+			if buffered == 64 {
+				binary.LittleEndian.PutUint64(dst[out:out+8], reservoir)
+				out += 8
+				reservoir = 0
+				buffered = 0
+			}
+		}
+	}
+
+	for buffered > 0 {
+		dst[out] = byte(reservoir)
+		out++
+		if buffered <= 8 {
+			break
+		}
+		reservoir >>= 8
+		buffered -= 8
+	}
+}
+
+func (p *BitPacker) grow(count int, bitWidth uint8) {
+	bytesNeeded := (uint(count)*uint(bitWidth) + 7) / 8
+	startLen := len(p.buf)
+	endLen := startLen + int(bytesNeeded)
+	if endLen > cap(p.buf) {
+		p.buf = append(p.buf, make([]byte, endLen-startLen)...)
+		return
+	}
+	p.buf = p.buf[:endLen]
+	clear(p.buf[startLen:endLen])
 }
 
 // packValue packs a single value with the given bit width.
@@ -79,8 +183,11 @@ func (p *BitPacker) Reset() {
 
 // BitUnpacker unpacks integers from a bit stream.
 type BitUnpacker struct {
-	buf    []byte
-	bitPos uint
+	buf       []byte
+	bitPos    uint
+	bytePos   int
+	reservoir uint64
+	buffered  uint
 }
 
 // NewBitUnpacker creates a new bit unpacker from the given bytes.
@@ -97,9 +204,7 @@ func (u *BitUnpacker) Unpack(n int, bitWidth uint8) []uint64 {
 	}
 
 	result := make([]uint64, n)
-	for i := 0; i < n; i++ {
-		result[i] = u.unpackValue(bitWidth)
-	}
+	u.UnpackInto(result, bitWidth)
 	return result
 }
 
@@ -111,6 +216,37 @@ func (u *BitUnpacker) UnpackInto(dst []uint64, bitWidth uint8) {
 		}
 		return
 	}
+	if u.bitPos == 0 {
+		bytesPerValue := 0
+		switch bitWidth {
+		case 8:
+			bytesPerValue = 1
+		case 16:
+			bytesPerValue = 2
+		case 32:
+			bytesPerValue = 4
+		case 64:
+			bytesPerValue = 8
+		}
+		if bytesPerValue != 0 && len(u.buf) >= len(dst)*bytesPerValue {
+			for i := range dst {
+				offset := i * bytesPerValue
+				switch bitWidth {
+				case 8:
+					dst[i] = uint64(u.buf[offset])
+				case 16:
+					dst[i] = uint64(binary.LittleEndian.Uint16(u.buf[offset:]))
+				case 32:
+					dst[i] = uint64(binary.LittleEndian.Uint32(u.buf[offset:]))
+				case 64:
+					dst[i] = binary.LittleEndian.Uint64(u.buf[offset:])
+				}
+			}
+			u.bytePos = len(dst) * bytesPerValue
+			u.bitPos = uint(u.bytePos * 8)
+			return
+		}
+	}
 
 	for i := range dst {
 		dst[i] = u.unpackValue(bitWidth)
@@ -119,42 +255,56 @@ func (u *BitUnpacker) UnpackInto(dst []uint64, bitWidth uint8) {
 
 // unpackValue unpacks a single value with the given bit width.
 func (u *BitUnpacker) unpackValue(bitWidth uint8) uint64 {
-	var v uint64
 	remaining := uint(bitWidth)
-	shift := uint(0)
+	var value uint64
+	var shift uint
 
 	for remaining > 0 {
-		byteIdx := u.bitPos / 8
-		bitOffset := u.bitPos % 8
-
-		if int(byteIdx) >= len(u.buf) {
-			break
+		if u.buffered == 0 {
+			available := len(u.buf) - u.bytePos
+			if available >= 8 {
+				u.reservoir = binary.LittleEndian.Uint64(u.buf[u.bytePos : u.bytePos+8])
+				u.bytePos += 8
+				u.buffered = 64
+			} else if available > 0 {
+				u.reservoir = 0
+				for i := 0; i < available; i++ {
+					u.reservoir |= uint64(u.buf[u.bytePos+i]) << (8 * i)
+				}
+				u.bytePos += available
+				u.buffered = uint(available * 8)
+			} else {
+				break
+			}
 		}
 
-		// How many bits can we read from this byte?
-		bitsAvailable := 8 - bitOffset
-		if bitsAvailable > remaining {
-			bitsAvailable = remaining
+		take := remaining
+		if take > u.buffered {
+			take = u.buffered
 		}
-
-		// Extract bits
-		mask := byte((1 << bitsAvailable) - 1)
-		bits := (u.buf[byteIdx] >> bitOffset) & mask
-
-		// Add to result
-		v |= uint64(bits) << shift
-
-		u.bitPos += bitsAvailable
-		remaining -= bitsAvailable
-		shift += bitsAvailable
+		chunk := u.reservoir
+		if take < 64 {
+			chunk &= (uint64(1) << take) - 1
+			u.reservoir >>= take
+		} else {
+			u.reservoir = 0
+		}
+		value |= chunk << shift
+		u.buffered -= take
+		remaining -= take
+		shift += take
 	}
 
-	return v
+	u.bitPos += uint(bitWidth) - remaining
+	return value
 }
 
 // Reset resets the unpacker to the beginning.
 func (u *BitUnpacker) Reset() {
 	u.bitPos = 0
+	u.bytePos = 0
+	u.reservoir = 0
+	u.buffered = 0
 }
 
 // PackedBlock represents a fully compressed ALP block.
@@ -178,16 +328,9 @@ type PackedBlock struct {
 
 // PackBlock compresses an EncodedBlock into a PackedBlock.
 func PackBlock(block *EncodedBlock) *PackedBlock {
-	// Convert signed to unsigned for bit packing
-	values := make([]uint64, len(block.Encoded))
-	for i, v := range block.Encoded {
-		// Values are already relative to FrameOfRef, so they're non-negative
-		values[i] = uint64(v)
-	}
-
 	// Pack the values
-	packer := NewBitPacker(len(values) * int(block.BitWidth+7) / 8)
-	packer.Pack(values, block.BitWidth)
+	packer := NewBitPacker(len(block.Encoded) * int(block.BitWidth+7) / 8)
+	packer.packInt64(block.Encoded, block.BitWidth)
 
 	return &PackedBlock{
 		Data:         packer.Bytes(),

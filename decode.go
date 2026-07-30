@@ -100,6 +100,42 @@ func (d *Decoder) DecodeVector(block *EncodedBlock, result []float64) {
 	}
 }
 
+// decodePackedInto fuses bit unpacking and ALP decoding, avoiding the
+// temporary uint64, int64, and float64 slices otherwise created per block.
+func (d *Decoder) decodePackedInto(block *PackedBlock, result []float64) int {
+	n := min(block.Count, len(result))
+	if n == 0 {
+		return 0
+	}
+
+	unpacker := BitUnpacker{buf: block.Data}
+	exceptionIdx := 0
+	nextException := -1
+	if len(block.ExceptionPos) > 0 {
+		nextException = int(block.ExceptionPos[0])
+	}
+
+	frameOfRef := block.FrameOfRef
+	exp := block.Exp
+	factor := block.Factor
+	for i := 0; i < n; i++ {
+		encoded := int64(unpacker.unpackValue(block.BitWidth)) + frameOfRef
+		if i == nextException {
+			result[i] = math.Float64frombits(block.Exceptions[exceptionIdx])
+			exceptionIdx++
+			if exceptionIdx < len(block.ExceptionPos) {
+				nextException = int(block.ExceptionPos[exceptionIdx])
+			} else {
+				nextException = -1
+			}
+			continue
+		}
+		result[i] = decodeValue(encoded, exp, factor)
+	}
+
+	return n
+}
+
 // DecodeInPlace decodes values directly into the encoded slice, converting int64 to float64.
 // The caller must ensure the underlying memory can hold float64 values.
 // This is useful when you want to avoid allocation.

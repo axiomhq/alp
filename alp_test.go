@@ -182,6 +182,32 @@ func TestBitPacker(t *testing.T) {
 	}
 }
 
+func TestBitPackerAllWidths(t *testing.T) {
+	lengths := []int{1, 2, 7, 8, 9, 63, 64, 65, VectorSize}
+	for bitWidth := uint8(1); bitWidth <= 64; bitWidth++ {
+		for _, n := range lengths {
+			values := make([]uint64, n)
+			mask := ^uint64(0)
+			if bitWidth < 64 {
+				mask = (uint64(1) << bitWidth) - 1
+			}
+			for i := range values {
+				// Deterministic values that exercise both sparse and high bits.
+				values[i] = (uint64(i)*0x9e3779b97f4a7c15 ^ uint64(n)) & mask
+			}
+
+			packer := NewBitPacker((n*int(bitWidth) + 7) / 8)
+			packer.Pack(values, bitWidth)
+			got := NewBitUnpacker(packer.Bytes()).Unpack(n, bitWidth)
+			for i := range values {
+				if got[i] != values[i] {
+					t.Fatalf("width %d length %d index %d: got %d, want %d", bitWidth, n, i, got[i], values[i])
+				}
+			}
+		}
+	}
+}
+
 func TestRDEncodeDecode(t *testing.T) {
 	// High-precision values that don't compress well with standard ALP
 	data := []float64{
@@ -264,6 +290,26 @@ func TestEmptyInput(t *testing.T) {
 	decompressed := DecompressFloat64(compressed)
 	if len(decompressed) != 0 {
 		t.Error("expected empty output for empty input")
+	}
+}
+
+func TestDecompressIntoRaw(t *testing.T) {
+	values := []float64{1.25, math.Copysign(0, -1), math.Inf(1), math.NaN()}
+	raw := make([]uint64, len(values))
+	for i, value := range values {
+		raw[i] = math.Float64bits(value)
+	}
+	compressed := &CompressedData{Scheme: SchemeRaw, Count: len(values), RawData: raw}
+	dst := make([]float64, len(values)-1)
+
+	written := NewDecompressor().DecompressInto(compressed, dst)
+	if written != len(dst) {
+		t.Fatalf("wrote %d values, want %d", written, len(dst))
+	}
+	for i := range dst {
+		if math.Float64bits(dst[i]) != raw[i] {
+			t.Fatalf("value %d: got bits %x, want %x", i, math.Float64bits(dst[i]), raw[i])
+		}
 	}
 }
 
@@ -423,6 +469,8 @@ func BenchmarkBitPack(b *testing.B) {
 	}
 }
 
+var benchmarkBitUnpackResult []uint64
+
 func BenchmarkBitUnpack(b *testing.B) {
 	values := make([]uint64, VectorSize)
 	for i := range values {
@@ -438,7 +486,7 @@ func BenchmarkBitUnpack(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		unpacker := NewBitUnpacker(data)
-		_ = unpacker.Unpack(VectorSize, 8)
+		benchmarkBitUnpackResult = unpacker.Unpack(VectorSize, 8)
 	}
 }
 

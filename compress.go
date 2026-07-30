@@ -174,15 +174,16 @@ func (d *Decompressor) Decompress(data *CompressedData) []float64 {
 		return nil
 	}
 
-	result := make([]float64, 0, data.Count)
-
+	var result []float64
 	switch data.Scheme {
 	case SchemeALP:
+		result = make([]float64, data.Count)
+		written := 0
 		for _, packed := range data.ALPBlocks {
-			block := UnpackBlock(packed)
-			result = append(result, d.decoder.Decode(block)...)
+			written += d.decoder.decodePackedInto(packed, result[written:])
 		}
 	case SchemeALPRD:
+		result = make([]float64, 0, data.Count)
 		for _, block := range data.RDBlocks {
 			result = append(result, d.rdDecoder.Decode(block)...)
 		}
@@ -192,6 +193,8 @@ func (d *Decompressor) Decompress(data *CompressedData) []float64 {
 			result[i] = math.Float64frombits(bits)
 		}
 		return result
+	default:
+		return nil
 	}
 
 	// Trim to exact count (last block may have been padded)
@@ -213,10 +216,7 @@ func (d *Decompressor) DecompressInto(data *CompressedData, dst []float64) int {
 	switch data.Scheme {
 	case SchemeALP:
 		for _, packed := range data.ALPBlocks {
-			block := UnpackBlock(packed)
-			decoded := d.decoder.Decode(block)
-			n := copy(dst[written:], decoded)
-			written += n
+			written += d.decoder.decodePackedInto(packed, dst[written:])
 			if written >= len(dst) {
 				break
 			}
@@ -230,6 +230,12 @@ func (d *Decompressor) DecompressInto(data *CompressedData, dst []float64) int {
 				break
 			}
 		}
+	case SchemeRaw:
+		n := min(len(data.RawData), len(dst))
+		for i, bits := range data.RawData[:n] {
+			dst[i] = math.Float64frombits(bits)
+		}
+		written = n
 	}
 
 	return written

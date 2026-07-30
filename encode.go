@@ -140,7 +140,8 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 		score      int // lower is better
 	}
 
-	var candidates []combo
+	var best combo
+	found := false
 
 	// Try all valid (exp, factor) combinations where factor <= exp
 	// This matches the reference implementation's search space
@@ -164,26 +165,22 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 			// Each exception adds ~10 bytes overhead, each bit adds ~n/8 bytes
 			score := exceptions*80 + bitWidth*len(samples)/8
 
-			candidates = append(candidates, combo{
+			candidate := combo{
 				exp:        exp,
 				factor:     factor,
 				exceptions: exceptions,
 				bitWidth:   bitWidth,
 				score:      score,
-			})
+			}
+			if !found || candidate.score < best.score {
+				best = candidate
+				found = true
+			}
 		}
 	}
 
-	// Find combination with lowest score
-	if len(candidates) == 0 {
+	if !found {
 		return factorExponentPair{0, 0, len(samples)}
-	}
-
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.score < best.score {
-			best = c
-		}
 	}
 
 	return factorExponentPair{
@@ -197,14 +194,31 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 func (e *Encoder) analyzeWithExpFactor(samples []float64, exp, factor uint8) (exceptions int, minVal, maxVal int64) {
 	minVal = int64(1<<62 - 1)
 	maxVal = int64(-1 << 62)
+	expMult := float64ExpArr[exp]
+	factorFrac := float64FracArr[factor]
+	factMult := float64(float64FactArr[factor])
+	expFrac := float64FracArr[exp]
 
 	for _, v := range samples {
-		if !e.canEncode(v, exp, factor) {
+		bits := math.Float64bits(v)
+		if bits&float64ExponentMask == float64ExponentMask || bits == float64NegZeroBits {
 			exceptions++
 			continue
 		}
 
-		encoded := encodeValue(v, exp, factor)
+		scaled := v * expMult * factorFrac
+		var encoded int64
+		if scaled >= 0 {
+			encoded = int64(scaled + 0.5)
+		} else {
+			encoded = int64(scaled - 0.5)
+		}
+		decoded := float64(encoded) * factMult * expFrac
+		if encoded < encodingLowerLimit || encoded > encodingUpperLimit ||
+			math.Float64bits(decoded) != bits {
+			exceptions++
+			continue
+		}
 		if encoded < minVal {
 			minVal = encoded
 		}
@@ -417,17 +431,13 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	rng := uint64(maxVal - minVal)
 	block.BitWidth = uint8(bitsRequired(rng))
 
-	// Create exception lookup for O(1) check
-	isException := make([]bool, VectorSize)
-	for _, pos := range block.ExceptionPos {
-		isException[pos] = true
-	}
-
-	// Subtract frame of reference
+	// Subtract frame of reference. Exception slots are reset afterwards; their
+	// packed values are ignored by the decoder.
 	for i := 0; i < VectorSize; i++ {
-		if !isException[i] {
-			block.Encoded[i] -= minVal
-		}
+		block.Encoded[i] -= minVal
+	}
+	for _, pos := range block.ExceptionPos {
+		block.Encoded[pos] = 0
 	}
 
 	return block
