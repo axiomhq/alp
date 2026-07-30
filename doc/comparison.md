@@ -67,10 +67,4 @@ Our Go implementation achieves:
 - **~1000 MB/s decode** for 1024-element vectors
 - **0.16 ratio** on typical decimal data
 
-To run the comparison benchmark locally:
-
-```bash
-go get github.com/klauspost/compress/zstd
-go test -tags=comparison -bench=Compare -benchmem
-go test -tags=comparison -run=TestCompareCompressionRatio -v
-```
+The package benchmark can be run with `go test -bench=. -benchmem`.

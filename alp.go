@@ -1,52 +1,96 @@
 // Package alp implements Adaptive Lossless floating-Point compression.
 //
-// ALP is a state-of-the-art lossless compression algorithm for IEEE 754
-// floating-point data. It exploits the fact that most real-world floats
-// represent decimal values (like 3.14, 10.5, etc.) that can be exactly
-// represented as integers multiplied by powers of ten.
+// ALP is a lossless compression scheme for floating-point data from
+// SIGMOD 2024. It exploits the fact that most real-world floats are
+// human-friendly decimals that can be represented as integers scaled by
+// powers of 10.
 //
-// The algorithm works by:
-//  1. Finding optimal exponent E and factor F to convert floats to integers
-//  2. Encoding: encoded = round(value × 10^E)
-//  3. Using Frame-of-Reference encoding with bit-packing
-//  4. Handling exceptions for values that don't roundtrip correctly
-//
-// For high-precision floats that don't fit this pattern, ALP RD (Real Doubles)
-// splits the IEEE 754 representation and uses dictionary encoding.
-//
-// Reference: "ALP: Adaptive Lossless floating-Point Compression"
-// Afroozeh, Kuffó, Boncz - ACM SIGMOD 2024
+// Reference: https://dl.acm.org/doi/10.1145/3626717
 package alp
 
-// Scheme indicates which compression scheme to use.
-type Scheme uint8
-
-const (
-	SchemeInvalid Scheme = iota
-	SchemeALP            // Standard ALP for decimal floats
-	SchemeALPRD          // ALP Real Doubles for high-precision floats
-	SchemeRaw            // Uncompressed (when compression would expand data)
-)
-
-// VectorSize is the number of elements processed in one vector.
-// Chosen to be SIMD-friendly (1024 = 16 × 64).
+// VectorSize is the number of values per compression block.
+// This matches the paper's recommendation for cache efficiency.
 const VectorSize = 1024
 
-// Config holds sampling and encoding parameters.
-type Config struct {
-	// RowGroupSize is the number of values in a row group.
-	RowGroupSize int
-	// SamplesPerVector is how many samples to take per vector.
-	SamplesPerVector int
-	// TopKCombinations is how many factor/exponent pairs to evaluate.
-	TopKCombinations int
+// State holds the encoding parameters learned from sampling.
+// A single State can encode many vectors of similar data.
+type State struct {
+	Exp    uint8 // Exponent: multiply by 10^Exp before rounding
+	Factor uint8 // Factor: divide by 10^Factor after rounding
 }
 
-// DefaultConfig returns sensible defaults.
-func DefaultConfig() Config {
-	return Config{
-		RowGroupSize:     100 * VectorSize,
-		SamplesPerVector: 32,
-		TopKCombinations: 5,
+// Vector is a compressed block of VectorSize float64 values.
+type Vector struct {
+	// Encoded contains the integers after ALP transformation.
+	Encoded [VectorSize]int64
+
+	// FrameOfRef is the minimum encoded value subtracted for bit-packing.
+	FrameOfRef int64
+
+	// BitWidth is the number of bits needed to represent max-min.
+	BitWidth uint8
+
+	// Exp and Factor are the encoding parameters used for this vector.
+	Exp    uint8
+	Factor uint8
+
+	// ExceptionPos and ExceptionBits contain the positions and raw float bits
+	// for values that do not round-trip through the integer transform. Only the
+	// first NumExceptions entries are valid.
+	NumExceptions uint16
+	ExceptionPos  [VectorSize]uint16
+	ExceptionBits [VectorSize]uint64
+}
+
+// Sample analyzes data to find encoding parameters.
+func Sample(data []float64) State {
+	if len(data) == 0 {
+		return State{}
 	}
+
+	samples := sampleData(data)
+	exp, factor := findBestParameters(samples)
+	return State{Exp: exp, Factor: factor}
+}
+
+// Encoding limits from the ALP paper.
+const (
+	minEncodable = -9223372036854775807 // -(2^63 - 1)
+	maxEncodable = 9223372036854775807  // 2^63 - 1
+)
+
+// bitWidth returns the number of bits needed to represent v.
+func bitWidth(v uint64) uint8 {
+	if v == 0 {
+		return 0
+	}
+	return uint8(64 - leadingZeros64(v))
+}
+
+func leadingZeros64(x uint64) int {
+	n := 0
+	if x <= 0x00000000FFFFFFFF {
+		n += 32
+		x <<= 32
+	}
+	if x <= 0x0000FFFFFFFFFFFF {
+		n += 16
+		x <<= 16
+	}
+	if x <= 0x00FFFFFFFFFFFFFF {
+		n += 8
+		x <<= 8
+	}
+	if x <= 0x0FFFFFFFFFFFFFFF {
+		n += 4
+		x <<= 4
+	}
+	if x <= 0x3FFFFFFFFFFFFFFF {
+		n += 2
+		x <<= 2
+	}
+	if x <= 0x7FFFFFFFFFFFFFFF {
+		n++
+	}
+	return n
 }
