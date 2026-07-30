@@ -436,7 +436,17 @@ func PackBlock(block *EncodedBlock) *PackedBlock {
 func packBlockTo(block *EncodedBlock, packed *PackedBlock) {
 	var data []byte
 	if block.BitWidth != 0 && len(block.Encoded) != 0 {
-		data = make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
+		data = make([]byte, packedDataLen(len(block.Encoded), block.BitWidth))
+	}
+	packBlockDataTo(block, packed, data)
+}
+
+func packedDataLen(count int, bitWidth uint8) int {
+	return (count*int(bitWidth) + 7) / 8
+}
+
+func packBlockDataTo(block *EncodedBlock, packed *PackedBlock, data []byte) {
+	if len(data) != 0 {
 		packFixedWidth(data, block.Encoded, block.BitWidth)
 	}
 
@@ -461,6 +471,11 @@ func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
 }
 
 func packBlockAbsoluteTo(block *EncodedBlock, packed *PackedBlock) {
+	data := make([]byte, packedDataLen(len(block.Encoded), block.BitWidth))
+	packBlockAbsoluteDataTo(block, packed, data)
+}
+
+func packBlockAbsoluteDataTo(block *EncodedBlock, packed *PackedBlock, data []byte) {
 	// Exception slots are encoded as zero relative to the frame in the
 	// canonical path. Store the frame itself before fused subtraction so the
 	// packed bytes remain identical.
@@ -472,11 +487,10 @@ func packBlockAbsoluteTo(block *EncodedBlock, packed *PackedBlock) {
 		for i := range block.Encoded {
 			block.Encoded[i] -= block.FrameOfRef
 		}
-		packBlockTo(block, packed)
+		packBlockDataTo(block, packed, data)
 		return
 	}
 
-	data := make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
 	if block.BitWidth == 10 {
 		packFixedWidth10Offset(data, block.Encoded, block.FrameOfRef)
 	} else {

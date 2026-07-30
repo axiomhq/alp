@@ -15,7 +15,6 @@ type Compressor struct {
 	rdEncoder      *RDEncoder
 	encodedScratch []int64
 	encodedBlock   EncodedBlock
-	packedBlock    PackedBlock
 	scheme         Scheme
 }
 
@@ -33,9 +32,9 @@ func (c *Compressor) Analyze(data []float64) Scheme {
 	return scheme
 }
 
-// analyze returns the packed sample block so an immediate Compress call can
-// reuse work performed for scheme selection.
-func (c *Compressor) analyze(data []float64) (Scheme, *PackedBlock) {
+// analyze returns the encoded sample block so an immediate Compress call can
+// pack it directly into the result's shared byte arena.
+func (c *Compressor) analyze(data []float64) (Scheme, *EncodedBlock) {
 	if len(data) == 0 {
 		c.scheme = SchemeInvalid
 		return c.scheme, nil
@@ -51,18 +50,14 @@ func (c *Compressor) analyze(data []float64) (Scheme, *PackedBlock) {
 	sample := data[:sampleSize]
 
 	var block *EncodedBlock
-	var packed *PackedBlock
 	if sampleSize == VectorSize {
 		block = c.encodeVector(sample)
-		packBlockAbsoluteTo(block, &c.packedBlock)
-		packed = &c.packedBlock
 	} else {
 		block = c.encoder.Encode(sample)
-		packed = PackBlock(block)
 	}
 
 	// Calculate actual ALP size per value
-	alpBlockSize := 21 + len(packed.Data) + len(packed.ExceptionPos)*2 + len(packed.Exceptions)*8
+	alpBlockSize := 21 + packedDataLen(len(block.Encoded), block.BitWidth) + len(block.ExceptionPos)*2 + len(block.Exceptions)*8
 	alpBytesPerValue := float64(alpBlockSize) / float64(sampleSize)
 
 	// Extrapolate to full data
@@ -72,7 +67,7 @@ func (c *Compressor) analyze(data []float64) (Scheme, *PackedBlock) {
 	// If ALP compresses well (< 95% of original), use it
 	if float64(alpEstSize) < float64(originalSize)*0.95 {
 		c.scheme = SchemeALP
-		return c.scheme, packed
+		return c.scheme, block
 	}
 
 	// For now, skip ALP RD as it doesn't compress well in current implementation
@@ -95,7 +90,7 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 		return &CompressedData{Scheme: SchemeInvalid}
 	}
 
-	var firstBlock *PackedBlock
+	var firstBlock *EncodedBlock
 	// Analyze if not already done, retaining the sample block for compression.
 	if c.scheme == SchemeInvalid {
 		_, firstBlock = c.analyze(data)
@@ -122,14 +117,25 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 }
 
 // compressALP compresses data using the standard ALP algorithm.
-func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*PackedBlock {
+func (c *Compressor) compressALP(data []float64, firstBlock *EncodedBlock) []*PackedBlock {
 	n := len(data)
 	numVectors := (n + VectorSize - 1) / VectorSize
 	blocks := make([]*PackedBlock, 0, numVectors)
 	storage := make([]PackedBlock, numVectors)
+	estimatedBytes := 0
+	if firstBlock != nil {
+		estimatedBytes = packedDataLen(n, firstBlock.BitWidth)
+	}
+	dataStorage := make([]byte, 0, estimatedBytes)
 	start := 0
 	if firstBlock != nil {
-		storage[0] = *firstBlock
+		dataLen := packedDataLen(len(firstBlock.Encoded), firstBlock.BitWidth)
+		dataStorage = append(dataStorage, make([]byte, dataLen)...)
+		if len(firstBlock.Encoded) == VectorSize {
+			packBlockAbsoluteDataTo(firstBlock, &storage[0], dataStorage)
+		} else {
+			packBlockDataTo(firstBlock, &storage[0], dataStorage)
+		}
 		blocks = append(blocks, &storage[0])
 		start = min(VectorSize, n)
 	}
@@ -149,11 +155,21 @@ func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*Pac
 
 		if end-i == VectorSize {
 			packed := &storage[len(blocks)]
-			packBlockAbsoluteTo(encoded, packed)
+			if len(blocks) == 0 && cap(dataStorage) == 0 {
+				dataStorage = make([]byte, 0, packedDataLen(n, encoded.BitWidth))
+			}
+			dataStart := len(dataStorage)
+			dataStorage = append(dataStorage, make([]byte, packedDataLen(len(encoded.Encoded), encoded.BitWidth))...)
+			packBlockAbsoluteDataTo(encoded, packed, dataStorage[dataStart:])
 			blocks = append(blocks, packed)
 		} else {
 			packed := &storage[len(blocks)]
-			packBlockTo(encoded, packed)
+			if len(blocks) == 0 && cap(dataStorage) == 0 {
+				dataStorage = make([]byte, 0, packedDataLen(n, encoded.BitWidth))
+			}
+			dataStart := len(dataStorage)
+			dataStorage = append(dataStorage, make([]byte, packedDataLen(len(encoded.Encoded), encoded.BitWidth))...)
+			packBlockDataTo(encoded, packed, dataStorage[dataStart:])
 			blocks = append(blocks, packed)
 		}
 	}
