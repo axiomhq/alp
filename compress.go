@@ -11,7 +11,7 @@ import (
 // It automatically selects between ALP and ALP RD based on data characteristics.
 type Compressor struct {
 	cfg            Config
-	encoder        *Encoder
+	encoder        Encoder
 	rdEncoder      *RDEncoder
 	encodedScratch []int64
 	encodedBlock   EncodedBlock
@@ -22,9 +22,8 @@ type Compressor struct {
 // NewCompressor creates a new ALP compressor.
 func NewCompressor(cfg Config) *Compressor {
 	return &Compressor{
-		cfg:       cfg,
-		encoder:   NewEncoder(cfg),
-		rdEncoder: NewRDEncoder(cfg),
+		cfg:     cfg,
+		encoder: Encoder{cfg: cfg},
 	}
 }
 
@@ -164,6 +163,10 @@ func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*Pac
 
 // compressRD compresses data using ALP RD algorithm.
 func (c *Compressor) compressRD(data []float64) []*RDEncodedBlock {
+	if c.rdEncoder == nil {
+		c.rdEncoder = NewRDEncoder(c.cfg)
+	}
+
 	n := len(data)
 	numVectors := (n + VectorSize - 1) / VectorSize
 	blocks := make([]*RDEncodedBlock, 0, numVectors)
