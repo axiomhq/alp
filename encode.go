@@ -407,11 +407,10 @@ func (e *Encoder) encodeVectorAbsoluteInto(data []float64, encoded []int64) *Enc
 }
 
 func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool) *EncodedBlock {
-	block := &EncodedBlock{
-		Encoded: encoded[:VectorSize],
-		Exp:     e.exp,
-		Factor:  e.factor,
-	}
+	data = data[:VectorSize]
+	encoded = encoded[:VectorSize]
+	var exceptionPos []uint16
+	var exceptions []uint64
 
 	// Vectorized encoding pass
 	minVal := int64(math.MaxInt64)
@@ -426,55 +425,66 @@ func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool)
 	for idx, v := range data {
 		bits := math.Float64bits(v)
 		scaled := v * encodeMult
-		var encoded int64
+		var value int64
 		if scaled >= 0 {
-			encoded = int64(scaled + 0.5)
+			value = int64(scaled + 0.5)
 		} else {
-			encoded = int64(scaled - 0.5)
+			value = int64(scaled - 0.5)
 		}
 
-		decoded := float64(encoded) * factMult * fracMult
-		if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
-			if block.ExceptionPos == nil {
-				block.ExceptionPos = make([]uint16, 0, 8)
-				block.Exceptions = make([]uint64, 0, 8)
+		decoded := float64(value) * factMult * fracMult
+		if math.Float64bits(decoded) != bits || value < encodingLowerLimit || value > encodingUpperLimit {
+			if exceptionPos == nil {
+				exceptionPos = make([]uint16, 0, 8)
+				exceptions = make([]uint64, 0, 8)
 			}
-			block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
-			block.Exceptions = append(block.Exceptions, bits)
-			block.Encoded[idx] = 0
+			exceptionPos = append(exceptionPos, uint16(idx))
+			exceptions = append(exceptions, bits)
+			encoded[idx] = 0
 			continue
 		}
 
-		block.Encoded[idx] = encoded
-		if encoded < minVal {
-			minVal = encoded
+		encoded[idx] = value
+		if value < minVal {
+			minVal = value
 		}
-		if encoded > maxVal {
-			maxVal = encoded
+		if value > maxVal {
+			maxVal = value
 		}
 	}
 
 	// Handle all-exceptions case
-	if len(block.ExceptionPos) == VectorSize {
-		block.FrameOfRef = 0
-		block.BitWidth = 0
-		return block
+	if len(exceptionPos) == VectorSize {
+		return &EncodedBlock{
+			Encoded:      encoded,
+			ExceptionPos: exceptionPos,
+			Exceptions:   exceptions,
+			Exp:          e.exp,
+			Factor:       e.factor,
+		}
 	}
 
-	block.FrameOfRef = minVal
 	rng := uint64(maxVal - minVal)
-	block.BitWidth = uint8(bitsRequired(rng))
+	bitWidth := uint8(bitsRequired(rng))
 
 	if applyFrame {
 		// Subtract frame of reference. Exception slots are reset afterwards;
 		// their packed values are ignored by the decoder.
 		for i := 0; i < VectorSize; i++ {
-			block.Encoded[i] -= minVal
+			encoded[i] -= minVal
 		}
-		for _, pos := range block.ExceptionPos {
-			block.Encoded[pos] = 0
+		for _, pos := range exceptionPos {
+			encoded[pos] = 0
 		}
 	}
 
-	return block
+	return &EncodedBlock{
+		Encoded:      encoded,
+		FrameOfRef:   minVal,
+		BitWidth:     bitWidth,
+		ExceptionPos: exceptionPos,
+		Exceptions:   exceptions,
+		Exp:          e.exp,
+		Factor:       e.factor,
+	}
 }
