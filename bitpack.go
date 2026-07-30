@@ -428,13 +428,19 @@ type PackedBlock struct {
 
 // PackBlock compresses an EncodedBlock into a PackedBlock.
 func PackBlock(block *EncodedBlock) *PackedBlock {
+	packed := new(PackedBlock)
+	packBlockTo(block, packed)
+	return packed
+}
+
+func packBlockTo(block *EncodedBlock, packed *PackedBlock) {
 	var data []byte
 	if block.BitWidth != 0 && len(block.Encoded) != 0 {
 		data = make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
 		packFixedWidth(data, block.Encoded, block.BitWidth)
 	}
 
-	return &PackedBlock{
+	*packed = PackedBlock{
 		Data:         data,
 		Count:        len(block.Encoded),
 		FrameOfRef:   block.FrameOfRef,
@@ -449,6 +455,12 @@ func PackBlock(block *EncodedBlock) *PackedBlock {
 // packBlockAbsolute packs values before frame subtraction. Hot widths fuse
 // subtraction into grouped packing; other widths use the canonical path.
 func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
+	packed := new(PackedBlock)
+	packBlockAbsoluteTo(block, packed)
+	return packed
+}
+
+func packBlockAbsoluteTo(block *EncodedBlock, packed *PackedBlock) {
 	// Exception slots are encoded as zero relative to the frame in the
 	// canonical path. Store the frame itself before fused subtraction so the
 	// packed bytes remain identical.
@@ -460,7 +472,8 @@ func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
 		for i := range block.Encoded {
 			block.Encoded[i] -= block.FrameOfRef
 		}
-		return PackBlock(block)
+		packBlockTo(block, packed)
+		return
 	}
 
 	data := make([]byte, (len(block.Encoded)*int(block.BitWidth)+7)/8)
@@ -470,7 +483,7 @@ func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
 		packFixedWidth20Offset(data, block.Encoded, block.FrameOfRef)
 	}
 
-	return &PackedBlock{
+	*packed = PackedBlock{
 		Data:         data,
 		Count:        len(block.Encoded),
 		FrameOfRef:   block.FrameOfRef,

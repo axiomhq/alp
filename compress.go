@@ -15,6 +15,7 @@ type Compressor struct {
 	rdEncoder      *RDEncoder
 	encodedScratch []int64
 	encodedBlock   EncodedBlock
+	packedBlock    PackedBlock
 	scheme         Scheme
 }
 
@@ -54,7 +55,8 @@ func (c *Compressor) analyze(data []float64) (Scheme, *PackedBlock) {
 	var packed *PackedBlock
 	if sampleSize == VectorSize {
 		block = c.encodeVector(sample)
-		packed = packBlockAbsolute(block)
+		packBlockAbsoluteTo(block, &c.packedBlock)
+		packed = &c.packedBlock
 	} else {
 		block = c.encoder.Encode(sample)
 		packed = PackBlock(block)
@@ -125,9 +127,11 @@ func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*Pac
 	n := len(data)
 	numVectors := (n + VectorSize - 1) / VectorSize
 	blocks := make([]*PackedBlock, 0, numVectors)
+	storage := make([]PackedBlock, numVectors)
 	start := 0
 	if firstBlock != nil {
-		blocks = append(blocks, firstBlock)
+		storage[0] = *firstBlock
+		blocks = append(blocks, &storage[0])
 		start = min(VectorSize, n)
 	}
 
@@ -145,9 +149,13 @@ func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*Pac
 		}
 
 		if end-i == VectorSize {
-			blocks = append(blocks, packBlockAbsolute(encoded))
+			packed := &storage[len(blocks)]
+			packBlockAbsoluteTo(encoded, packed)
+			blocks = append(blocks, packed)
 		} else {
-			blocks = append(blocks, PackBlock(encoded))
+			packed := &storage[len(blocks)]
+			packBlockTo(encoded, packed)
+			blocks = append(blocks, packed)
 		}
 	}
 
