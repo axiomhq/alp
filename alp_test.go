@@ -345,6 +345,50 @@ func TestBitsRequired(t *testing.T) {
 	}
 }
 
+func TestFindBestCombinationPruningMatchesExhaustive(t *testing.T) {
+	patterns := [][]float64{
+		generateMonetaryData(VectorSize),
+		generateSensorData(VectorSize),
+		generateScientificData(VectorSize),
+		{0, math.Copysign(0, -1), math.Inf(1), math.Inf(-1), math.NaN(), math.Pi, -123.45},
+	}
+
+	encoder := NewEncoder(DefaultConfig())
+	for patternIndex, data := range patterns {
+		samples := encoder.sampleData(data)
+		got := encoder.findBestCombination(samples)
+
+		var want factorExponentPair
+		bestScore := 0
+		found := false
+		for exp := uint8(0); exp <= float64MaxExponent; exp++ {
+			for factor := uint8(0); factor <= exp && int(factor) < len(float64FactArr); factor++ {
+				exceptions, minVal, maxVal := encoder.analyzeWithExpFactor(samples, exp, factor)
+				if exceptions > len(samples)/2 {
+					continue
+				}
+				bitWidth := 0
+				if maxVal > minVal {
+					bitWidth = bitsRequired(uint64(maxVal - minVal))
+				}
+				score := exceptions*80 + bitWidth*len(samples)/8
+				if !found || score < bestScore {
+					want = factorExponentPair{exp: exp, factor: factor, exceptions: exceptions}
+					bestScore = score
+					found = true
+				}
+			}
+		}
+		if !found {
+			want = factorExponentPair{exp: 0, factor: 0, exceptions: len(samples)}
+		}
+
+		if got != want {
+			t.Fatalf("pattern %d: pruned result %+v, exhaustive result %+v", patternIndex, got, want)
+		}
+	}
+}
+
 func TestLeadingZeros(t *testing.T) {
 	tests := []struct {
 		x    uint64

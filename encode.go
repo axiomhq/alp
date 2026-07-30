@@ -147,7 +147,16 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 	// This matches the reference implementation's search space
 	for exp := uint8(0); exp <= float64MaxExponent; exp++ {
 		for factor := uint8(0); factor <= exp && int(factor) < len(float64FactArr); factor++ {
-			exceptions, minVal, maxVal := e.analyzeWithExpFactor(samples, exp, factor)
+			scoreLimit := -1
+			if found {
+				scoreLimit = best.score
+			}
+			exceptions, minVal, maxVal, complete := e.analyzeWithExpFactorBounded(
+				samples, exp, factor, scoreLimit, true,
+			)
+			if !complete {
+				continue
+			}
 
 			// Skip if too many exceptions
 			if exceptions > len(samples)/2 {
@@ -192,6 +201,14 @@ func (e *Encoder) findBestCombination(samples []float64) factorExponentPair {
 
 // analyzeWithExpFactor counts exceptions and finds min/max encoded values.
 func (e *Encoder) analyzeWithExpFactor(samples []float64, exp, factor uint8) (exceptions int, minVal, maxVal int64) {
+	exceptions, minVal, maxVal, _ = e.analyzeWithExpFactorBounded(samples, exp, factor, -1, false)
+	return exceptions, minVal, maxVal
+}
+
+// analyzeWithExpFactorBounded stops once a candidate cannot beat scoreLimit.
+// Exception count and encoded range are monotonic, so the partial score is a
+// lower bound on the candidate's final score.
+func (e *Encoder) analyzeWithExpFactorBounded(samples []float64, exp, factor uint8, scoreLimit int, rejectMajority bool) (exceptions int, minVal, maxVal int64, complete bool) {
 	minVal = int64(1<<62 - 1)
 	maxVal = int64(-1 << 62)
 	expMult := float64ExpArr[exp]
@@ -199,35 +216,47 @@ func (e *Encoder) analyzeWithExpFactor(samples []float64, exp, factor uint8) (ex
 	factMult := float64(float64FactArr[factor])
 	expFrac := float64FracArr[exp]
 
-	for _, v := range samples {
+	for i, v := range samples {
 		bits := math.Float64bits(v)
 		if bits&float64ExponentMask == float64ExponentMask || bits == float64NegZeroBits {
 			exceptions++
-			continue
+		} else {
+			scaled := v * expMult * factorFrac
+			var encoded int64
+			if scaled >= 0 {
+				encoded = int64(scaled + 0.5)
+			} else {
+				encoded = int64(scaled - 0.5)
+			}
+			decoded := float64(encoded) * factMult * expFrac
+			if encoded < encodingLowerLimit || encoded > encodingUpperLimit ||
+				math.Float64bits(decoded) != bits {
+				exceptions++
+			} else {
+				if encoded < minVal {
+					minVal = encoded
+				}
+				if encoded > maxVal {
+					maxVal = encoded
+				}
+			}
 		}
 
-		scaled := v * expMult * factorFrac
-		var encoded int64
-		if scaled >= 0 {
-			encoded = int64(scaled + 0.5)
-		} else {
-			encoded = int64(scaled - 0.5)
+		if rejectMajority && exceptions > len(samples)/2 {
+			return exceptions, minVal, maxVal, false
 		}
-		decoded := float64(encoded) * factMult * expFrac
-		if encoded < encodingLowerLimit || encoded > encodingUpperLimit ||
-			math.Float64bits(decoded) != bits {
-			exceptions++
-			continue
-		}
-		if encoded < minVal {
-			minVal = encoded
-		}
-		if encoded > maxVal {
-			maxVal = encoded
+		if scoreLimit >= 0 && i&7 == 7 {
+			lowerBound := exceptions * 80
+			if maxVal > minVal {
+				lowerBound += bitsRequired(uint64(maxVal-minVal)) * len(samples) / 8
+			}
+			if lowerBound >= scoreLimit {
+				return exceptions, minVal, maxVal, false
+			}
 		}
 	}
 
-	return exceptions, minVal, maxVal
+	return exceptions, minVal, maxVal, true
 }
 
 // countExceptions counts how many samples don't roundtrip correctly.
