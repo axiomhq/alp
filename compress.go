@@ -14,6 +14,7 @@ type Compressor struct {
 	encoder        *Encoder
 	rdEncoder      *RDEncoder
 	encodedScratch []int64
+	encodedBlock   EncodedBlock
 	scheme         Scheme
 }
 
@@ -83,7 +84,8 @@ func (c *Compressor) encodeVector(data []float64) *EncodedBlock {
 	if c.encodedScratch == nil {
 		c.encodedScratch = make([]int64, VectorSize)
 	}
-	return c.encoder.encodeVectorAbsoluteInto(data, c.encodedScratch)
+	c.encoder.encodeVectorTo(data, c.encodedScratch, false, &c.encodedBlock)
+	return &c.encodedBlock
 }
 
 // Compress compresses a slice of float64 values.

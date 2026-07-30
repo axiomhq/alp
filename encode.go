@@ -407,6 +407,12 @@ func (e *Encoder) encodeVectorAbsoluteInto(data []float64, encoded []int64) *Enc
 }
 
 func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool) *EncodedBlock {
+	block := new(EncodedBlock)
+	e.encodeVectorTo(data, encoded, applyFrame, block)
+	return block
+}
+
+func (e *Encoder) encodeVectorTo(data []float64, encoded []int64, applyFrame bool, block *EncodedBlock) {
 	data = data[:VectorSize]
 	encoded = encoded[:VectorSize]
 	var exceptionPos []uint16
@@ -455,13 +461,14 @@ func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool)
 
 	// Handle all-exceptions case
 	if len(exceptionPos) == VectorSize {
-		return &EncodedBlock{
+		*block = EncodedBlock{
 			Encoded:      encoded,
 			ExceptionPos: exceptionPos,
 			Exceptions:   exceptions,
 			Exp:          e.exp,
 			Factor:       e.factor,
 		}
+		return
 	}
 
 	rng := uint64(maxVal - minVal)
@@ -478,7 +485,7 @@ func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool)
 		}
 	}
 
-	return &EncodedBlock{
+	*block = EncodedBlock{
 		Encoded:      encoded,
 		FrameOfRef:   minVal,
 		BitWidth:     bitWidth,
