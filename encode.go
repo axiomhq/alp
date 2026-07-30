@@ -328,19 +328,29 @@ func (e *Encoder) Encode(data []float64) *EncodedBlock {
 	// First pass: encode all values and identify exceptions
 	minVal := int64(math.MaxInt64)
 	maxVal := int64(math.MinInt64)
+	encodeMult := float64ExpArr[e.exp] * float64FracArr[e.factor]
+	factMult := float64(float64FactArr[e.factor])
+	fracMult := float64FracArr[e.exp]
 
 	for i, v := range data {
-		if isSpecialFloat64(v) || !e.canEncode(v, e.exp, e.factor) {
-			// Mark as exception
+		bits := math.Float64bits(v)
+		scaled := v * encodeMult
+		var encoded int64
+		if scaled >= 0 {
+			encoded = int64(scaled + 0.5)
+		} else {
+			encoded = int64(scaled - 0.5)
+		}
+
+		decoded := float64(encoded) * factMult * fracMult
+		if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
 			block.ExceptionPos = append(block.ExceptionPos, uint16(i))
-			block.Exceptions = append(block.Exceptions, math.Float64bits(v))
-			block.Encoded[i] = 0 // Placeholder
+			block.Exceptions = append(block.Exceptions, bits)
+			block.Encoded[i] = 0
 			continue
 		}
 
-		encoded := encodeValue(v, e.exp, e.factor)
 		block.Encoded[i] = encoded
-
 		if encoded < minVal {
 			minVal = encoded
 		}
@@ -363,19 +373,13 @@ func (e *Encoder) Encode(data []float64) *EncodedBlock {
 	rng := uint64(maxVal - minVal)
 	block.BitWidth = uint8(bitsRequired(rng))
 
-	// Subtract frame of reference from all non-exception values
+	// Subtract the frame in one linear pass, then restore exception slots to
+	// their canonical zero placeholder.
 	for i := range block.Encoded {
-		// Skip exceptions (they have placeholder values)
-		isException := false
-		for _, pos := range block.ExceptionPos {
-			if int(pos) == i {
-				isException = true
-				break
-			}
-		}
-		if !isException {
-			block.Encoded[i] -= minVal
-		}
+		block.Encoded[i] -= minVal
+	}
+	for _, pos := range block.ExceptionPos {
+		block.Encoded[pos] = 0
 	}
 
 	return block
