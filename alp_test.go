@@ -208,6 +208,85 @@ func TestBitPackerAllWidths(t *testing.T) {
 	}
 }
 
+func TestDecodePackedAllWidths(t *testing.T) {
+	decoder := NewDecoder()
+	lengths := []int{1, 2, 3, 4, 7, 8, 9, 63, 64, 65}
+	for bitWidth := uint8(0); bitWidth <= 64; bitWidth++ {
+		for _, count := range lengths {
+			mask := ^uint64(0)
+			if bitWidth < 64 {
+				mask = (uint64(1) << bitWidth) - 1
+			}
+			encoded := make([]int64, count)
+			for i := range encoded {
+				encoded[i] = int64((uint64(i) * 0x9e3779b97f4a7c15) & mask)
+			}
+			exceptionPos := count / 2
+			block := &EncodedBlock{
+				Encoded:      encoded,
+				FrameOfRef:   -17,
+				BitWidth:     bitWidth,
+				ExceptionPos: []uint16{uint16(exceptionPos)},
+				Exceptions:   []uint64{math.Float64bits(math.Pi)},
+			}
+			packed := PackBlock(block)
+			result := make([]float64, count)
+			if got := decoder.decodePackedInto(packed, result); got != count {
+				t.Fatalf("width %d length %d: decoded %d values, want %d", bitWidth, count, got, count)
+			}
+
+			for i := range result {
+				want := float64(encoded[i] - 17)
+				if i == exceptionPos {
+					want = math.Pi
+				}
+				if math.Float64bits(result[i]) != math.Float64bits(want) {
+					t.Fatalf("width %d length %d index %d: got %v, want %v", bitWidth, count, i, result[i], want)
+				}
+			}
+		}
+	}
+}
+
+func TestAbsolutePackingMatchesCanonical(t *testing.T) {
+	sequential := make([]float64, VectorSize)
+	withExceptions := make([]float64, VectorSize)
+	for i := range sequential {
+		sequential[i] = float64(i) * 0.01
+		withExceptions[i] = sequential[i]
+		if i%100 == 0 {
+			withExceptions[i] = math.Pi + float64(i)
+		}
+	}
+
+	patterns := [][]float64{
+		sequential,
+		generateMonetaryData(VectorSize),
+		withExceptions,
+	}
+	for patternIndex, data := range patterns {
+		encoder := NewEncoder(DefaultConfig())
+		encoder.Sample(data)
+		canonical := PackBlock(encoder.EncodeVector(data))
+		absoluteBlock := encoder.encodeVectorAbsoluteInto(data, make([]int64, VectorSize))
+		fused := packBlockAbsolute(absoluteBlock)
+
+		if canonical.Count != fused.Count || canonical.FrameOfRef != fused.FrameOfRef ||
+			canonical.BitWidth != fused.BitWidth || canonical.Exp != fused.Exp || canonical.Factor != fused.Factor ||
+			!bytes.Equal(canonical.Data, fused.Data) {
+			t.Fatalf("pattern %d: fused block metadata or data differs from canonical block", patternIndex)
+		}
+		if len(canonical.ExceptionPos) != len(fused.ExceptionPos) || len(canonical.Exceptions) != len(fused.Exceptions) {
+			t.Fatalf("pattern %d: fused exception lengths differ", patternIndex)
+		}
+		for i := range canonical.ExceptionPos {
+			if canonical.ExceptionPos[i] != fused.ExceptionPos[i] || canonical.Exceptions[i] != fused.Exceptions[i] {
+				t.Fatalf("pattern %d exception %d differs", patternIndex, i)
+			}
+		}
+	}
+}
+
 func TestRDEncodeDecode(t *testing.T) {
 	// High-precision values that don't compress well with standard ALP
 	data := []float64{

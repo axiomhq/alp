@@ -245,7 +245,7 @@ func (e *Encoder) analyzeWithExpFactorBounded(samples []float64, exp, factor uin
 		if rejectMajority && exceptions > len(samples)/2 {
 			return exceptions, minVal, maxVal, false
 		}
-		if scoreLimit >= 0 && i&7 == 7 {
+		if scoreLimit >= 0 && i&3 == 3 {
 			lowerBound := exceptions * 80
 			if maxVal > minVal {
 				lowerBound += bitsRequired(uint64(maxVal-minVal)) * len(samples) / 8
@@ -387,13 +387,26 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	if len(data) != VectorSize {
 		return e.Encode(data)
 	}
+	return e.encodeVectorInto(data, make([]int64, VectorSize))
+}
 
+// encodeVectorInto encodes a full vector using caller-owned scratch storage.
+// The returned block is valid until encoded is reused.
+func (e *Encoder) encodeVectorInto(data []float64, encoded []int64) *EncodedBlock {
+	return e.encodeVector(data, encoded, true)
+}
+
+// encodeVectorAbsoluteInto leaves encoded values before frame subtraction so
+// the compressor can fuse that operation into bit packing.
+func (e *Encoder) encodeVectorAbsoluteInto(data []float64, encoded []int64) *EncodedBlock {
+	return e.encodeVector(data, encoded, false)
+}
+
+func (e *Encoder) encodeVector(data []float64, encoded []int64, applyFrame bool) *EncodedBlock {
 	block := &EncodedBlock{
-		Encoded:      make([]int64, VectorSize),
-		ExceptionPos: make([]uint16, 0, 8), // Preallocate for typical case
-		Exceptions:   make([]uint64, 0, 8),
-		Exp:          e.exp,
-		Factor:       e.factor,
+		Encoded: encoded[:VectorSize],
+		Exp:     e.exp,
+		Factor:  e.factor,
 	}
 
 	// Vectorized encoding pass
@@ -403,49 +416,37 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	// Pre-compute encode multiplier
 	// Encode: value × EXP_ARR[exp] × FRAC_ARR[factor]
 	encodeMult := float64ExpArr[e.exp] * float64FracArr[e.factor]
-	// For decode, we use decodeValue to ensure consistent floating-point operations
+	factMult := float64(float64FactArr[e.factor])
+	fracMult := float64FracArr[e.exp]
 
-	// Process in cache-friendly chunks of 8
-	for i := 0; i < VectorSize; i += 8 {
-		for j := 0; j < 8; j++ {
-			idx := i + j
-			v := data[idx]
+	for idx, v := range data {
+		bits := math.Float64bits(v)
+		scaled := v * encodeMult
+		var encoded int64
+		if scaled >= 0 {
+			encoded = int64(scaled + 0.5)
+		} else {
+			encoded = int64(scaled - 0.5)
+		}
 
-			// Fast path: check if value is special
-			bits := math.Float64bits(v)
-			if bits&float64ExponentMask == float64ExponentMask || bits == float64NegZeroBits {
-				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
-				block.Exceptions = append(block.Exceptions, bits)
-				block.Encoded[idx] = 0
-				continue
+		decoded := float64(encoded) * factMult * fracMult
+		if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
+			if block.ExceptionPos == nil {
+				block.ExceptionPos = make([]uint16, 0, 8)
+				block.Exceptions = make([]uint64, 0, 8)
 			}
+			block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
+			block.Exceptions = append(block.Exceptions, bits)
+			block.Encoded[idx] = 0
+			continue
+		}
 
-			// Encode
-			scaled := v * encodeMult
-			var encoded int64
-			if scaled >= 0 {
-				encoded = int64(scaled + 0.5)
-			} else {
-				encoded = int64(scaled - 0.5)
-			}
-
-			// Verify roundtrip (bit-exact comparison for lossless guarantee)
-			// Use decodeValue to ensure consistent floating-point operations
-			decoded := decodeValue(encoded, e.exp, e.factor)
-			if math.Float64bits(decoded) != bits || encoded < encodingLowerLimit || encoded > encodingUpperLimit {
-				block.ExceptionPos = append(block.ExceptionPos, uint16(idx))
-				block.Exceptions = append(block.Exceptions, bits)
-				block.Encoded[idx] = 0
-				continue
-			}
-
-			block.Encoded[idx] = encoded
-			if encoded < minVal {
-				minVal = encoded
-			}
-			if encoded > maxVal {
-				maxVal = encoded
-			}
+		block.Encoded[idx] = encoded
+		if encoded < minVal {
+			minVal = encoded
+		}
+		if encoded > maxVal {
+			maxVal = encoded
 		}
 	}
 
@@ -460,13 +461,15 @@ func (e *Encoder) EncodeVector(data []float64) *EncodedBlock {
 	rng := uint64(maxVal - minVal)
 	block.BitWidth = uint8(bitsRequired(rng))
 
-	// Subtract frame of reference. Exception slots are reset afterwards; their
-	// packed values are ignored by the decoder.
-	for i := 0; i < VectorSize; i++ {
-		block.Encoded[i] -= minVal
-	}
-	for _, pos := range block.ExceptionPos {
-		block.Encoded[pos] = 0
+	if applyFrame {
+		// Subtract frame of reference. Exception slots are reset afterwards;
+		// their packed values are ignored by the decoder.
+		for i := 0; i < VectorSize; i++ {
+			block.Encoded[i] -= minVal
+		}
+		for _, pos := range block.ExceptionPos {
+			block.Encoded[pos] = 0
+		}
 	}
 
 	return block

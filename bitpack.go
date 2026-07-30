@@ -64,10 +64,16 @@ func packFixedWidth[T ~int64 | ~uint64](dst []byte, values []T, bitWidth uint8) 
 			dst[i] = byte(value)
 		}
 		return
+	case 10:
+		packFixedWidth10(dst, values)
+		return
 	case 16:
 		for i, value := range values {
 			binary.LittleEndian.PutUint16(dst[i*2:], uint16(value))
 		}
+		return
+	case 20:
+		packFixedWidth20(dst, values)
 		return
 	case 32:
 		for i, value := range values {
@@ -80,6 +86,100 @@ func packFixedWidth[T ~int64 | ~uint64](dst []byte, values []T, bitWidth uint8) 
 		}
 		return
 	}
+	packFixedWidthReservoir(dst, values, bitWidth)
+}
+
+func packFixedWidth10[T ~int64 | ~uint64](dst []byte, values []T) {
+	i := 0
+	out := 0
+	for ; i+8 <= len(values); i += 8 {
+		v0 := uint64(values[i]) & 0x3ff
+		v1 := uint64(values[i+1]) & 0x3ff
+		v2 := uint64(values[i+2]) & 0x3ff
+		v3 := uint64(values[i+3]) & 0x3ff
+		v4 := uint64(values[i+4]) & 0x3ff
+		v5 := uint64(values[i+5]) & 0x3ff
+		v6 := uint64(values[i+6]) & 0x3ff
+		v7 := uint64(values[i+7]) & 0x3ff
+		lo := v0 | v1<<10 | v2<<20 | v3<<30 | v4<<40 | v5<<50 | v6<<60
+		hi := uint16(v6>>4 | v7<<6)
+		binary.LittleEndian.PutUint64(dst[out:out+8], lo)
+		binary.LittleEndian.PutUint16(dst[out+8:out+10], hi)
+		out += 10
+	}
+	if i < len(values) {
+		packFixedWidthReservoir(dst[out:], values[i:], 10)
+	}
+}
+
+func packFixedWidth20[T ~int64 | ~uint64](dst []byte, values []T) {
+	i := 0
+	out := 0
+	for ; i+4 <= len(values); i += 4 {
+		v0 := uint64(values[i]) & 0xfffff
+		v1 := uint64(values[i+1]) & 0xfffff
+		v2 := uint64(values[i+2]) & 0xfffff
+		v3 := uint64(values[i+3]) & 0xfffff
+		lo := v0 | v1<<20 | v2<<40 | v3<<60
+		hi := uint16(v3 >> 4)
+		binary.LittleEndian.PutUint64(dst[out:out+8], lo)
+		binary.LittleEndian.PutUint16(dst[out+8:out+10], hi)
+		out += 10
+	}
+	if i < len(values) {
+		packFixedWidthReservoir(dst[out:], values[i:], 20)
+	}
+}
+
+func packFixedWidth10Offset(dst []byte, values []int64, frameOfRef int64) {
+	i := 0
+	out := 0
+	for ; i+8 <= len(values); i += 8 {
+		v0 := uint64(values[i]-frameOfRef) & 0x3ff
+		v1 := uint64(values[i+1]-frameOfRef) & 0x3ff
+		v2 := uint64(values[i+2]-frameOfRef) & 0x3ff
+		v3 := uint64(values[i+3]-frameOfRef) & 0x3ff
+		v4 := uint64(values[i+4]-frameOfRef) & 0x3ff
+		v5 := uint64(values[i+5]-frameOfRef) & 0x3ff
+		v6 := uint64(values[i+6]-frameOfRef) & 0x3ff
+		v7 := uint64(values[i+7]-frameOfRef) & 0x3ff
+		lo := v0 | v1<<10 | v2<<20 | v3<<30 | v4<<40 | v5<<50 | v6<<60
+		hi := uint16(v6>>4 | v7<<6)
+		binary.LittleEndian.PutUint64(dst[out:out+8], lo)
+		binary.LittleEndian.PutUint16(dst[out+8:out+10], hi)
+		out += 10
+	}
+	if i < len(values) {
+		for j := i; j < len(values); j++ {
+			values[j] -= frameOfRef
+		}
+		packFixedWidthReservoir(dst[out:], values[i:], 10)
+	}
+}
+
+func packFixedWidth20Offset(dst []byte, values []int64, frameOfRef int64) {
+	i := 0
+	out := 0
+	for ; i+4 <= len(values); i += 4 {
+		v0 := uint64(values[i]-frameOfRef) & 0xfffff
+		v1 := uint64(values[i+1]-frameOfRef) & 0xfffff
+		v2 := uint64(values[i+2]-frameOfRef) & 0xfffff
+		v3 := uint64(values[i+3]-frameOfRef) & 0xfffff
+		lo := v0 | v1<<20 | v2<<40 | v3<<60
+		hi := uint16(v3 >> 4)
+		binary.LittleEndian.PutUint64(dst[out:out+8], lo)
+		binary.LittleEndian.PutUint16(dst[out+8:out+10], hi)
+		out += 10
+	}
+	if i < len(values) {
+		for j := i; j < len(values); j++ {
+			values[j] -= frameOfRef
+		}
+		packFixedWidthReservoir(dst[out:], values[i:], 20)
+	}
+}
+
+func packFixedWidthReservoir[T ~int64 | ~uint64](dst []byte, values []T, bitWidth uint8) {
 
 	width := uint(bitWidth)
 	mask := ^uint64(0)
@@ -331,6 +431,43 @@ func PackBlock(block *EncodedBlock) *PackedBlock {
 	// Pack the values
 	packer := NewBitPacker(len(block.Encoded) * int(block.BitWidth+7) / 8)
 	packer.packInt64(block.Encoded, block.BitWidth)
+
+	return &PackedBlock{
+		Data:         packer.Bytes(),
+		Count:        len(block.Encoded),
+		FrameOfRef:   block.FrameOfRef,
+		BitWidth:     block.BitWidth,
+		Exp:          block.Exp,
+		Factor:       block.Factor,
+		ExceptionPos: block.ExceptionPos,
+		Exceptions:   block.Exceptions,
+	}
+}
+
+// packBlockAbsolute packs values before frame subtraction. Hot widths fuse
+// subtraction into grouped packing; other widths use the canonical path.
+func packBlockAbsolute(block *EncodedBlock) *PackedBlock {
+	// Exception slots are encoded as zero relative to the frame in the
+	// canonical path. Store the frame itself before fused subtraction so the
+	// packed bytes remain identical.
+	for _, pos := range block.ExceptionPos {
+		block.Encoded[pos] = block.FrameOfRef
+	}
+
+	if block.BitWidth != 10 && block.BitWidth != 20 {
+		for i := range block.Encoded {
+			block.Encoded[i] -= block.FrameOfRef
+		}
+		return PackBlock(block)
+	}
+
+	packer := NewBitPacker(len(block.Encoded) * int(block.BitWidth+7) / 8)
+	packer.grow(len(block.Encoded), block.BitWidth)
+	if block.BitWidth == 10 {
+		packFixedWidth10Offset(packer.buf, block.Encoded, block.FrameOfRef)
+	} else {
+		packFixedWidth20Offset(packer.buf, block.Encoded, block.FrameOfRef)
+	}
 
 	return &PackedBlock{
 		Data:         packer.Bytes(),

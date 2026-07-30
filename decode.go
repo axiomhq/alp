@@ -1,6 +1,7 @@
 package alp
 
 import (
+	"encoding/binary"
 	"math"
 )
 
@@ -108,32 +109,127 @@ func (d *Decoder) decodePackedInto(block *PackedBlock, result []float64) int {
 		return 0
 	}
 
-	unpacker := BitUnpacker{buf: block.Data}
-	exceptionIdx := 0
-	nextException := -1
-	if len(block.ExceptionPos) > 0 {
-		nextException = int(block.ExceptionPos[0])
+	frameOfRef := block.FrameOfRef
+	factMult := float64(float64FactArr[block.Factor])
+	fracMult := float64FracArr[block.Exp]
+	width := uint(block.BitWidth)
+
+	switch block.BitWidth {
+	case 0:
+		decoded := float64(frameOfRef) * factMult * fracMult
+		for i := 0; i < n; i++ {
+			result[i] = decoded
+		}
+	case 8:
+		for i, value := range block.Data[:n] {
+			result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+		}
+	case 10:
+		decodePacked10(block.Data, result[:n], frameOfRef, factMult, fracMult)
+	case 16:
+		for i := 0; i < n; i++ {
+			value := binary.LittleEndian.Uint16(block.Data[i*2:])
+			result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+		}
+	case 20:
+		decodePacked20(block.Data, result[:n], frameOfRef, factMult, fracMult)
+	case 32:
+		for i := 0; i < n; i++ {
+			value := binary.LittleEndian.Uint32(block.Data[i*4:])
+			result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+		}
+	case 64:
+		for i := 0; i < n; i++ {
+			value := binary.LittleEndian.Uint64(block.Data[i*8:])
+			result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+		}
+	default:
+		if width <= 56 {
+			mask := (uint64(1) << width) - 1
+			bitPos := uint(0)
+			for i := 0; i < n; i++ {
+				bytePos := int(bitPos >> 3)
+				var word uint64
+				if bytePos+8 <= len(block.Data) {
+					word = binary.LittleEndian.Uint64(block.Data[bytePos:])
+				} else {
+					for j, value := range block.Data[bytePos:] {
+						word |= uint64(value) << (8 * j)
+					}
+				}
+				value := (word >> (bitPos & 7)) & mask
+				result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+				bitPos += width
+			}
+		} else {
+			unpacker := BitUnpacker{buf: block.Data}
+			for i := 0; i < n; i++ {
+				value := unpacker.unpackValue(block.BitWidth)
+				result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+			}
+		}
 	}
 
-	frameOfRef := block.FrameOfRef
-	exp := block.Exp
-	factor := block.Factor
-	for i := 0; i < n; i++ {
-		encoded := int64(unpacker.unpackValue(block.BitWidth)) + frameOfRef
-		if i == nextException {
-			result[i] = math.Float64frombits(block.Exceptions[exceptionIdx])
-			exceptionIdx++
-			if exceptionIdx < len(block.ExceptionPos) {
-				nextException = int(block.ExceptionPos[exceptionIdx])
-			} else {
-				nextException = -1
-			}
-			continue
+	for i, pos := range block.ExceptionPos {
+		if int(pos) >= n || i >= len(block.Exceptions) {
+			break
 		}
-		result[i] = decodeValue(encoded, exp, factor)
+		result[pos] = math.Float64frombits(block.Exceptions[i])
 	}
 
 	return n
+}
+
+func decodePacked10(data []byte, result []float64, frameOfRef int64, factMult, fracMult float64) {
+	i := 0
+	bytePos := 0
+	for ; i+8 <= len(result); i += 8 {
+		lo := binary.LittleEndian.Uint64(data[bytePos : bytePos+8])
+		hi := uint64(binary.LittleEndian.Uint16(data[bytePos+8 : bytePos+10]))
+		result[i] = float64(int64(lo&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+1] = float64(int64((lo>>10)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+2] = float64(int64((lo>>20)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+3] = float64(int64((lo>>30)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+4] = float64(int64((lo>>40)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+5] = float64(int64((lo>>50)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+6] = float64(int64((lo>>60|hi<<4)&0x3ff)+frameOfRef) * factMult * fracMult
+		result[i+7] = float64(int64((hi>>6)&0x3ff)+frameOfRef) * factMult * fracMult
+		bytePos += 10
+	}
+	decodePackedRemainder(data[bytePos:], result[i:], 10, frameOfRef, factMult, fracMult)
+}
+
+func decodePacked20(data []byte, result []float64, frameOfRef int64, factMult, fracMult float64) {
+	i := 0
+	bytePos := 0
+	for ; i+4 <= len(result); i += 4 {
+		lo := binary.LittleEndian.Uint64(data[bytePos : bytePos+8])
+		hi := uint64(binary.LittleEndian.Uint16(data[bytePos+8 : bytePos+10]))
+		result[i] = float64(int64(lo&0xfffff)+frameOfRef) * factMult * fracMult
+		result[i+1] = float64(int64((lo>>20)&0xfffff)+frameOfRef) * factMult * fracMult
+		result[i+2] = float64(int64((lo>>40)&0xfffff)+frameOfRef) * factMult * fracMult
+		result[i+3] = float64(int64((lo>>60|hi<<4)&0xfffff)+frameOfRef) * factMult * fracMult
+		bytePos += 10
+	}
+	decodePackedRemainder(data[bytePos:], result[i:], 20, frameOfRef, factMult, fracMult)
+}
+
+func decodePackedRemainder(data []byte, result []float64, width uint, frameOfRef int64, factMult, fracMult float64) {
+	if len(result) == 0 {
+		return
+	}
+	mask := (uint64(1) << width) - 1
+	bitPos := uint(0)
+	for i := range result {
+		bytePos := int(bitPos >> 3)
+		var word uint64
+		for j, value := range data[bytePos:] {
+			word |= uint64(value) << (8 * j)
+		}
+		value := (word >> (bitPos & 7)) & mask
+		result[i] = float64(int64(value)+frameOfRef) * factMult * fracMult
+		bitPos += width
+	}
 }
 
 // DecodeInPlace decodes values directly into the encoded slice, converting int64 to float64.

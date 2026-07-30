@@ -10,10 +10,11 @@ import (
 // Compressor provides a unified interface for ALP compression.
 // It automatically selects between ALP and ALP RD based on data characteristics.
 type Compressor struct {
-	cfg       Config
-	encoder   *Encoder
-	rdEncoder *RDEncoder
-	scheme    Scheme
+	cfg            Config
+	encoder        *Encoder
+	rdEncoder      *RDEncoder
+	encodedScratch []int64
+	scheme         Scheme
 }
 
 // NewCompressor creates a new ALP compressor.
@@ -27,9 +28,16 @@ func NewCompressor(cfg Config) *Compressor {
 
 // Analyze samples the data and selects the best compression scheme.
 func (c *Compressor) Analyze(data []float64) Scheme {
+	scheme, _ := c.analyze(data)
+	return scheme
+}
+
+// analyze returns the packed sample block so an immediate Compress call can
+// reuse work performed for scheme selection.
+func (c *Compressor) analyze(data []float64) (Scheme, *PackedBlock) {
 	if len(data) == 0 {
 		c.scheme = SchemeInvalid
-		return c.scheme
+		return c.scheme, nil
 	}
 
 	originalSize := len(data) * 8 // 8 bytes per float64
@@ -41,8 +49,15 @@ func (c *Compressor) Analyze(data []float64) Scheme {
 	sampleSize := min(len(data), VectorSize)
 	sample := data[:sampleSize]
 
-	block := c.encoder.Encode(sample)
-	packed := PackBlock(block)
+	var block *EncodedBlock
+	var packed *PackedBlock
+	if sampleSize == VectorSize {
+		block = c.encodeVector(sample)
+		packed = packBlockAbsolute(block)
+	} else {
+		block = c.encoder.Encode(sample)
+		packed = PackBlock(block)
+	}
 
 	// Calculate actual ALP size per value
 	alpBlockSize := 21 + len(packed.Data) + len(packed.ExceptionPos)*2 + len(packed.Exceptions)*8
@@ -55,13 +70,20 @@ func (c *Compressor) Analyze(data []float64) Scheme {
 	// If ALP compresses well (< 95% of original), use it
 	if float64(alpEstSize) < float64(originalSize)*0.95 {
 		c.scheme = SchemeALP
-		return c.scheme
+		return c.scheme, packed
 	}
 
 	// For now, skip ALP RD as it doesn't compress well in current implementation
 	// Use raw passthrough instead
 	c.scheme = SchemeRaw
-	return c.scheme
+	return c.scheme, nil
+}
+
+func (c *Compressor) encodeVector(data []float64) *EncodedBlock {
+	if c.encodedScratch == nil {
+		c.encodedScratch = make([]int64, VectorSize)
+	}
+	return c.encoder.encodeVectorAbsoluteInto(data, c.encodedScratch)
 }
 
 // Compress compresses a slice of float64 values.
@@ -70,9 +92,10 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 		return &CompressedData{Scheme: SchemeInvalid}
 	}
 
-	// Analyze if not already done
+	var firstBlock *PackedBlock
+	// Analyze if not already done, retaining the sample block for compression.
 	if c.scheme == SchemeInvalid {
-		c.Analyze(data)
+		_, firstBlock = c.analyze(data)
 	}
 
 	result := &CompressedData{
@@ -82,7 +105,7 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 
 	switch c.scheme {
 	case SchemeALP:
-		result.ALPBlocks = c.compressALP(data)
+		result.ALPBlocks = c.compressALP(data, firstBlock)
 	case SchemeALPRD:
 		result.RDBlocks = c.compressRD(data)
 	case SchemeRaw:
@@ -96,12 +119,17 @@ func (c *Compressor) Compress(data []float64) *CompressedData {
 }
 
 // compressALP compresses data using the standard ALP algorithm.
-func (c *Compressor) compressALP(data []float64) []*PackedBlock {
+func (c *Compressor) compressALP(data []float64, firstBlock *PackedBlock) []*PackedBlock {
 	n := len(data)
 	numVectors := (n + VectorSize - 1) / VectorSize
 	blocks := make([]*PackedBlock, 0, numVectors)
+	start := 0
+	if firstBlock != nil {
+		blocks = append(blocks, firstBlock)
+		start = min(VectorSize, n)
+	}
 
-	for i := 0; i < n; i += VectorSize {
+	for i := start; i < n; i += VectorSize {
 		end := i + VectorSize
 		if end > n {
 			end = n
@@ -109,12 +137,16 @@ func (c *Compressor) compressALP(data []float64) []*PackedBlock {
 
 		var encoded *EncodedBlock
 		if end-i == VectorSize {
-			encoded = c.encoder.EncodeVector(data[i:end])
+			encoded = c.encodeVector(data[i:end])
 		} else {
 			encoded = c.encoder.Encode(data[i:end])
 		}
 
-		blocks = append(blocks, PackBlock(encoded))
+		if end-i == VectorSize {
+			blocks = append(blocks, packBlockAbsolute(encoded))
+		} else {
+			blocks = append(blocks, PackBlock(encoded))
+		}
 	}
 
 	return blocks
@@ -616,7 +648,6 @@ func readRDBlock(r io.Reader, block *RDEncodedBlock) (int64, error) {
 // CompressFloat64 compresses a slice of float64 values.
 func CompressFloat64(data []float64) *CompressedData {
 	c := NewCompressor(DefaultConfig())
-	c.Analyze(data)
 	return c.Compress(data)
 }
 
