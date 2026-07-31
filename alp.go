@@ -13,13 +13,21 @@ package alp
 const VectorSize = 1024
 
 // State holds the encoding parameters learned from sampling.
-// A single State can encode many vectors of similar data.
+// A single State can encode many vectors of similar data. Exp and Factor must
+// each be in the range 0..17. Callers should obtain a State from Sample rather
+// than setting its representation fields directly.
 type State struct {
 	Exp    uint8 // Exponent: multiply by 10^Exp before rounding
 	Factor uint8 // Factor: divide by 10^Factor after rounding
 }
 
-// Vector is a compressed block of VectorSize float64 values.
+// Vector is a compressed block of VectorSize float64 values. BitWidth must be
+// in the range 0..64, Exp and Factor must each be in the range 0..17, and
+// NumExceptions must not exceed VectorSize. The first NumExceptions entries in
+// ExceptionPos must be strictly increasing, unique positions less than
+// VectorSize; their corresponding ExceptionBits entries hold the original
+// float64 bits. Callers should construct vectors with Encode or a successful
+// Unpack rather than modifying representation fields directly.
 type Vector struct {
 	// Encoded contains the integers after ALP transformation.
 	Encoded [VectorSize]int64

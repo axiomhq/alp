@@ -3,12 +3,12 @@
 A small Go implementation of the ALP compression algorithm for IEEE 754
 `float64` data.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/axiomhq/alp.svg)](https://pkg.go.dev/github.com/axiomhq/alp)
+[![Go Reference](https://pkg.go.dev/badge/github.com/axiomhq/alp/v3.svg)](https://pkg.go.dev/github.com/axiomhq/alp/v3)
 
 ## Install
 
 ```bash
-go get github.com/axiomhq/alp
+go get github.com/axiomhq/alp/v3
 ```
 
 ## Use
@@ -22,7 +22,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/axiomhq/alp"
+	"github.com/axiomhq/alp/v3"
 )
 
 func main() {
@@ -40,7 +40,9 @@ func main() {
 	fmt.Printf("compressed to %d bytes\n", len(packed))
 
 	var restored alp.Vector
-	alp.Unpack(&restored, packed)
+	if err := alp.Unpack(&restored, packed); err != nil {
+		panic(err)
+	}
 
 	decoded := make([]float64, alp.VectorSize)
 	alp.Decode(decoded, &restored)
@@ -49,6 +51,23 @@ func main() {
 
 `Encode` and `Decode` do not allocate. `Pack` returns the serialized form of a
 vector, while `PackedSize` reports its size before allocation.
+
+## Migrating to v3
+
+Version 3 is the consolidated fixed-vector API at
+`github.com/axiomhq/alp/v3`. Existing root-module and `/v2` users remain on
+their prior contracts until they explicitly migrate; v3 does not replace those
+module paths.
+
+The arbitrary-length `CompressFloat64`, `DecompressFloat64`, `Compressor`,
+`Encoder`, `Decoder`, and stream-serialization APIs are not part of v3. Replace
+compression with `Sample`, `Encode`, and `Pack`, and replace decompression with
+`Unpack` and `Decode`, processing input in blocks of exactly 1,024 values.
+
+Packed v3 frames include a magic value and format version. `Unpack` rejects
+legacy bytes and unknown format versions instead of silently interpreting them
+as v3 data. The v3 frame format is distinct and must not be passed to legacy
+readers.
 
 ## Algorithm
 

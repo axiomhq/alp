@@ -1,25 +1,58 @@
 package alp
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+)
 
-const packedHeaderSize = 13
+const (
+	packedMagic           = "ALP3"
+	packedFormatVersion   = byte(1)
+	packedVersionOffset   = len(packedMagic)
+	packedFrameOffset     = packedVersionOffset + 1
+	packedBitWidthOffset  = packedFrameOffset + 8
+	packedExpOffset       = packedBitWidthOffset + 1
+	packedFactorOffset    = packedExpOffset + 1
+	packedExceptionOffset = packedFactorOffset + 1
+	packedHeaderSize      = packedExceptionOffset + 2
+	packedExceptionSize   = 10
+)
+
+var (
+	// ErrInvalidEncoding reports a malformed packed-frame value.
+	ErrInvalidEncoding = errors.New("alp: invalid packed encoding")
+
+	// ErrUnsupportedVersion reports a packed frame with an unknown format version.
+	ErrUnsupportedVersion = errors.New("alp: unsupported packed format version")
+)
 
 // Pack serializes a Vector to bytes.
 //
-// The format is a 13-byte header, bit-packed encoded values, then exceptions.
-// The header contains frame-of-reference (8 bytes), bit width, exponent,
-// factor, and exception count (2 bytes), all in little-endian order.
+// The format is an 18-byte header, bit-packed encoded values, then exceptions.
+// The header contains the four-byte "ALP3" magic, a format version,
+// frame-of-reference (8 bytes), bit width, exponent, factor, and exception
+// count (2 bytes). Multi-byte values are in little-endian order.
 func Pack(vector *Vector) []byte {
 	packedBits := VectorSize * int(vector.BitWidth)
 	packedBytes := (packedBits + 7) / 8
-	exceptionBytes := int(vector.NumExceptions) * 10
+	exceptionBytes := int(vector.NumExceptions) * packedExceptionSize
 
 	buffer := make([]byte, packedHeaderSize+packedBytes+exceptionBytes)
-	binary.LittleEndian.PutUint64(buffer[0:8], uint64(vector.FrameOfRef))
-	buffer[8] = vector.BitWidth
-	buffer[9] = vector.Exp
-	buffer[10] = vector.Factor
-	binary.LittleEndian.PutUint16(buffer[11:13], vector.NumExceptions)
+	copy(buffer[:len(packedMagic)], packedMagic)
+	buffer[packedVersionOffset] = packedFormatVersion
+	binary.LittleEndian.PutUint64(
+		buffer[packedFrameOffset:packedBitWidthOffset],
+		uint64(vector.FrameOfRef),
+	)
+	buffer[packedBitWidthOffset] = vector.BitWidth
+	buffer[packedExpOffset] = vector.Exp
+	buffer[packedFactorOffset] = vector.Factor
+	binary.LittleEndian.PutUint16(
+		buffer[packedExceptionOffset:packedHeaderSize],
+		vector.NumExceptions,
+	)
 
 	if vector.BitWidth > 0 {
 		packBits(buffer[packedHeaderSize:packedHeaderSize+packedBytes], vector.Encoded[:], vector.BitWidth)
@@ -29,45 +62,130 @@ func Pack(vector *Vector) []byte {
 	for i := uint16(0); i < vector.NumExceptions; i++ {
 		binary.LittleEndian.PutUint16(buffer[exceptionOffset:], vector.ExceptionPos[i])
 		binary.LittleEndian.PutUint64(buffer[exceptionOffset+2:], vector.ExceptionBits[i])
-		exceptionOffset += 10
+		exceptionOffset += packedExceptionSize
 	}
 
 	return buffer
 }
 
-// Unpack deserializes src into dst. If src is incomplete, Unpack decodes all
-// complete fields and leaves unavailable data at its zero value.
-func Unpack(dst *Vector, src []byte) {
-	*dst = Vector{}
+// Unpack deserializes one complete packed frame from src into dst. It rejects
+// malformed, truncated, unsupported, and trailing data. On error, dst is
+// unchanged.
+func Unpack(dst *Vector, src []byte) error {
 	if len(src) < packedHeaderSize {
-		return
+		return fmt.Errorf("alp: unpack header: %w", io.ErrUnexpectedEOF)
 	}
 
-	dst.FrameOfRef = int64(binary.LittleEndian.Uint64(src[0:8]))
-	dst.BitWidth = src[8]
-	dst.Exp = src[9]
-	dst.Factor = src[10]
-	dst.NumExceptions = binary.LittleEndian.Uint16(src[11:13])
+	if string(src[:len(packedMagic)]) != packedMagic {
+		return fmt.Errorf("alp: unpack magic: %w", ErrInvalidEncoding)
+	}
+	if src[packedVersionOffset] != packedFormatVersion {
+		return fmt.Errorf(
+			"alp: unpack version %d: %w",
+			src[packedVersionOffset],
+			ErrUnsupportedVersion,
+		)
+	}
 
-	packedBits := VectorSize * int(dst.BitWidth)
+	var decoded Vector
+	decoded.FrameOfRef = int64(binary.LittleEndian.Uint64(
+		src[packedFrameOffset:packedBitWidthOffset],
+	))
+	decoded.BitWidth = src[packedBitWidthOffset]
+	decoded.Exp = src[packedExpOffset]
+	decoded.Factor = src[packedFactorOffset]
+	decoded.NumExceptions = binary.LittleEndian.Uint16(
+		src[packedExceptionOffset:packedHeaderSize],
+	)
+
+	if decoded.BitWidth > 64 {
+		return fmt.Errorf(
+			"alp: unpack bit width %d: %w",
+			decoded.BitWidth,
+			ErrInvalidEncoding,
+		)
+	}
+	if decoded.Exp >= numExp {
+		return fmt.Errorf(
+			"alp: unpack exponent %d: %w",
+			decoded.Exp,
+			ErrInvalidEncoding,
+		)
+	}
+	if decoded.Factor >= numFact {
+		return fmt.Errorf(
+			"alp: unpack factor %d: %w",
+			decoded.Factor,
+			ErrInvalidEncoding,
+		)
+	}
+	if decoded.NumExceptions > VectorSize {
+		return fmt.Errorf(
+			"alp: unpack exception count %d: %w",
+			decoded.NumExceptions,
+			ErrInvalidEncoding,
+		)
+	}
+
+	packedBits := VectorSize * int(decoded.BitWidth)
 	packedBytes := (packedBits + 7) / 8
-	if packedBytes > len(src)-packedHeaderSize {
-		return
+	expectedSize := packedHeaderSize +
+		packedBytes +
+		int(decoded.NumExceptions)*packedExceptionSize
+	if len(src) < expectedSize {
+		return fmt.Errorf(
+			"alp: unpack frame: got %d bytes, need %d: %w",
+			len(src),
+			expectedSize,
+			io.ErrUnexpectedEOF,
+		)
+	}
+	if len(src) > expectedSize {
+		return fmt.Errorf(
+			"alp: unpack trailing data: got %d bytes, want %d: %w",
+			len(src),
+			expectedSize,
+			ErrInvalidEncoding,
+		)
 	}
 
-	if dst.BitWidth > 0 {
-		unpackBits(dst.Encoded[:], src[packedHeaderSize:packedHeaderSize+packedBytes], dst.BitWidth)
+	if decoded.BitWidth > 0 {
+		unpackBits(
+			decoded.Encoded[:],
+			src[packedHeaderSize:packedHeaderSize+packedBytes],
+			decoded.BitWidth,
+		)
 	}
 
 	exceptionOffset := packedHeaderSize + packedBytes
-	completeExceptions := uint16(0)
-	for completeExceptions < dst.NumExceptions && exceptionOffset+10 <= len(src) {
-		dst.ExceptionPos[completeExceptions] = binary.LittleEndian.Uint16(src[exceptionOffset:])
-		dst.ExceptionBits[completeExceptions] = binary.LittleEndian.Uint64(src[exceptionOffset+2:])
-		completeExceptions++
-		exceptionOffset += 10
+	var previousPosition uint16
+	for i := uint16(0); i < decoded.NumExceptions; i++ {
+		position := binary.LittleEndian.Uint16(src[exceptionOffset:])
+		if position >= VectorSize {
+			return fmt.Errorf(
+				"alp: unpack exception %d position %d: %w",
+				i,
+				position,
+				ErrInvalidEncoding,
+			)
+		}
+		if i > 0 && position <= previousPosition {
+			return fmt.Errorf(
+				"alp: unpack exception %d position %d after %d: %w",
+				i,
+				position,
+				previousPosition,
+				ErrInvalidEncoding,
+			)
+		}
+		decoded.ExceptionPos[i] = position
+		decoded.ExceptionBits[i] = binary.LittleEndian.Uint64(src[exceptionOffset+2:])
+		previousPosition = position
+		exceptionOffset += packedExceptionSize
 	}
-	dst.NumExceptions = completeExceptions
+
+	*dst = decoded
+	return nil
 }
 
 func packBits(dst []byte, src []int64, width uint8) {
@@ -172,6 +290,6 @@ func unpackBits(dst []int64, src []byte, width uint8) {
 func PackedSize(vector *Vector) int {
 	packedBits := VectorSize * int(vector.BitWidth)
 	packedBytes := (packedBits + 7) / 8
-	exceptionBytes := int(vector.NumExceptions) * 10
+	exceptionBytes := int(vector.NumExceptions) * packedExceptionSize
 	return packedHeaderSize + packedBytes + exceptionBytes
 }

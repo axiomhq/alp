@@ -1,6 +1,9 @@
 package alp
 
 import (
+	"encoding/binary"
+	"errors"
+	"io"
 	"math"
 	"math/rand"
 	"testing"
@@ -67,7 +70,9 @@ func TestPackUnpack(t *testing.T) {
 	}
 
 	var unpacked Vector
-	Unpack(&unpacked, packed)
+	if err := Unpack(&unpacked, packed); err != nil {
+		t.Fatalf("Unpack() error = %v", err)
+	}
 	decoded := make([]float64, VectorSize)
 	Decode(decoded, &unpacked)
 	assertEqualBits(t, source, decoded)
@@ -88,7 +93,9 @@ func TestPackUnpackAllExceptions(t *testing.T) {
 
 	packed := Pack(&encoded)
 	var unpacked Vector
-	Unpack(&unpacked, packed)
+	if err := Unpack(&unpacked, packed); err != nil {
+		t.Fatalf("Unpack() error = %v", err)
+	}
 	if got, want := unpacked.NumExceptions, uint16(VectorSize); got != want {
 		t.Fatalf("unpacked exception count = %d, want %d", got, want)
 	}
@@ -99,12 +106,132 @@ func TestPackUnpackAllExceptions(t *testing.T) {
 }
 
 func TestUnpackTruncatedInput(t *testing.T) {
-	var vector Vector
-	vector.FrameOfRef = 42
-	vector.NumExceptions = 7
-	Unpack(&vector, []byte{1, 2, 3})
-	if vector != (Vector{}) {
-		t.Fatal("truncated input did not clear destination")
+	packed := Pack(testPackedVector())
+	original := testDestinationVector()
+
+	for prefix := 0; prefix < len(packed); prefix++ {
+		dst := original
+		err := Unpack(&dst, packed[:prefix])
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("prefix %d: Unpack() error = %v, want io.ErrUnexpectedEOF", prefix, err)
+		}
+		if dst != original {
+			t.Fatalf("prefix %d: Unpack() modified destination", prefix)
+		}
+	}
+}
+
+func TestUnpackRejectsInvalidEncoding(t *testing.T) {
+	valid := Pack(testPackedVector())
+	packedBytes := (VectorSize*int(valid[packedBitWidthOffset]) + 7) / 8
+	firstException := packedHeaderSize + packedBytes
+	secondException := firstException + packedExceptionSize
+
+	tests := []struct {
+		name   string
+		change func([]byte) []byte
+		want   error
+	}{
+		{
+			name: "bad magic",
+			change: func(frame []byte) []byte {
+				frame[0] ^= 0xff
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "unknown version",
+			change: func(frame []byte) []byte {
+				frame[packedVersionOffset] = packedFormatVersion + 1
+				return frame
+			},
+			want: ErrUnsupportedVersion,
+		},
+		{
+			name: "invalid width",
+			change: func(frame []byte) []byte {
+				frame[packedBitWidthOffset] = 65
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "invalid exponent",
+			change: func(frame []byte) []byte {
+				frame[packedExpOffset] = numExp
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "invalid factor",
+			change: func(frame []byte) []byte {
+				frame[packedFactorOffset] = numFact
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "invalid exception count",
+			change: func(frame []byte) []byte {
+				binary.LittleEndian.PutUint16(
+					frame[packedExceptionOffset:packedHeaderSize],
+					VectorSize+1,
+				)
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "out of range exception position",
+			change: func(frame []byte) []byte {
+				binary.LittleEndian.PutUint16(frame[firstException:], VectorSize)
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "duplicate exception position",
+			change: func(frame []byte) []byte {
+				position := binary.LittleEndian.Uint16(frame[firstException:])
+				binary.LittleEndian.PutUint16(frame[secondException:], position)
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "non-increasing exception position",
+			change: func(frame []byte) []byte {
+				binary.LittleEndian.PutUint16(frame[firstException:], 2)
+				binary.LittleEndian.PutUint16(frame[secondException:], 1)
+				return frame
+			},
+			want: ErrInvalidEncoding,
+		},
+		{
+			name: "trailing data",
+			change: func(frame []byte) []byte {
+				return append(frame, 0)
+			},
+			want: ErrInvalidEncoding,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := append([]byte(nil), valid...)
+			frame = test.change(frame)
+			original := testDestinationVector()
+			dst := original
+			err := Unpack(&dst, frame)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Unpack() error = %v, want %v", err, test.want)
+			}
+			if dst != original {
+				t.Fatal("Unpack() modified destination")
+			}
+		})
 	}
 }
 
@@ -161,6 +288,37 @@ func assertEqualBits(t *testing.T, want, got []float64) {
 	}
 }
 
+func testPackedVector() *Vector {
+	vector := &Vector{
+		FrameOfRef:    -42,
+		BitWidth:      5,
+		Exp:           2,
+		Factor:        1,
+		NumExceptions: 2,
+	}
+	for i := range vector.Encoded {
+		vector.Encoded[i] = int64(i % 32)
+	}
+	vector.ExceptionPos[0] = 3
+	vector.ExceptionBits[0] = math.Float64bits(math.Inf(1))
+	vector.ExceptionPos[1] = VectorSize - 1
+	vector.ExceptionBits[1] = math.Float64bits(math.Copysign(0, -1))
+	return vector
+}
+
+func testDestinationVector() Vector {
+	return Vector{
+		Encoded:       [VectorSize]int64{0: 99, VectorSize - 1: -99},
+		FrameOfRef:    123,
+		BitWidth:      7,
+		Exp:           4,
+		Factor:        3,
+		NumExceptions: 1,
+		ExceptionPos:  [VectorSize]uint16{0: 17},
+		ExceptionBits: [VectorSize]uint64{0: 0x1234},
+	}
+}
+
 func FuzzEncodeDecode(f *testing.F) {
 	f.Add(int64(42), uint8(0))
 	f.Add(int64(7), uint8(1))
@@ -184,10 +342,26 @@ func FuzzEncodeDecode(f *testing.F) {
 		Encode(&encoded, source, Sample(source))
 		packed := Pack(&encoded)
 		var unpacked Vector
-		Unpack(&unpacked, packed)
+		if err := Unpack(&unpacked, packed); err != nil {
+			t.Fatalf("Unpack() error = %v", err)
+		}
 		decoded := make([]float64, VectorSize)
 		Decode(decoded, &unpacked)
 		assertEqualBits(t, source, decoded)
+	})
+}
+
+func FuzzUnpack(f *testing.F) {
+	f.Add(Pack(testPackedVector()))
+	f.Add([]byte(nil))
+
+	f.Fuzz(func(t *testing.T, packed []byte) {
+		var vector Vector
+		if err := Unpack(&vector, packed); err != nil {
+			return
+		}
+		decoded := make([]float64, VectorSize)
+		Decode(decoded, &vector)
 	})
 }
 
