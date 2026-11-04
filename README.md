@@ -36,25 +36,28 @@ func main() {
 	var vector alp.Vector
 	alp.Encode(&vector, values, state)
 
-	packed := alp.Pack(&vector)
+	packed := alp.Pack(nil, &vector)
 	fmt.Printf("compressed to %d bytes\n", len(packed))
 
 	var restored alp.Vector
-	alp.Unpack(&restored, packed)
+	if _, err := alp.Unpack(&restored, packed); err != nil {
+		panic(err)
+	}
 
 	decoded := make([]float64, alp.VectorSize)
 	alp.Decode(decoded, &restored)
 }
 ```
 
-`Encode` and `Decode` do not allocate. `Pack` returns the serialized form of a
-vector, while `PackedSize` reports its size before allocation.
+`Encode` and `Decode` do not allocate. `Pack` appends the serialized form of a
+vector to a buffer, and `Unpack` returns an error on truncated or corrupt input.
 
 ## Algorithm
 
 ALP finds an exponent and factor that transform decimal floating-point values
 into integers without losing their exact IEEE 754 representation. Each block is
-then frame-of-reference encoded and bit-packed. Values that do not round-trip
+then frame-of-reference encoded and bit-packed, either as values or as
+differences between neighbors, whichever packs narrower. Values that do not round-trip
 through the integer transform, including NaNs, infinities, and negative zero,
 are stored as exceptions using their original bits.
 

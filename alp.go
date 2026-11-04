@@ -1,19 +1,11 @@
-// Package alp implements Adaptive Lossless floating-Point compression.
-//
-// ALP is a lossless compression scheme for floating-point data from
-// SIGMOD 2024. It exploits the fact that most real-world floats are
-// human-friendly decimals that can be represented as integers scaled by
-// powers of 10.
-//
-// Reference: https://dl.acm.org/doi/10.1145/3626717
 package alp
 
-// VectorSize is the number of values per compression block.
-// This matches the paper's recommendation for cache efficiency.
+import "math/bits"
+
+// VectorSize is the number of values per compression block; it is part of the wire format.
 const VectorSize = 1024
 
 // State holds the encoding parameters learned from sampling.
-// A single State can encode many vectors of similar data.
 type State struct {
 	Exp    uint8 // Exponent: multiply by 10^Exp before rounding
 	Factor uint8 // Factor: divide by 10^Factor after rounding
@@ -24,8 +16,12 @@ type Vector struct {
 	// Encoded contains the integers after ALP transformation.
 	Encoded [VectorSize]int64
 
-	// FrameOfRef is the minimum encoded value subtracted for bit-packing.
+	// FrameOfRef is the minimum value (or delta, in delta mode) subtracted for bit-packing.
 	FrameOfRef int64
+
+	// Delta mode stores Base as the first value and later slots as differences.
+	Delta bool
+	Base  int64
 
 	// BitWidth is the number of bits needed to represent max-min.
 	BitWidth uint8
@@ -34,9 +30,7 @@ type Vector struct {
 	Exp    uint8
 	Factor uint8
 
-	// ExceptionPos and ExceptionBits contain the positions and raw float bits
-	// for values that do not round-trip through the integer transform. Only the
-	// first NumExceptions entries are valid.
+	// ExceptionPos and ExceptionBits hold values that do not round-trip; the first NumExceptions are valid.
 	NumExceptions uint16
 	ExceptionPos  [VectorSize]uint16
 	ExceptionBits [VectorSize]uint64
@@ -61,36 +55,5 @@ const (
 
 // bitWidth returns the number of bits needed to represent v.
 func bitWidth(v uint64) uint8 {
-	if v == 0 {
-		return 0
-	}
-	return uint8(64 - leadingZeros64(v))
-}
-
-func leadingZeros64(x uint64) int {
-	n := 0
-	if x <= 0x00000000FFFFFFFF {
-		n += 32
-		x <<= 32
-	}
-	if x <= 0x0000FFFFFFFFFFFF {
-		n += 16
-		x <<= 16
-	}
-	if x <= 0x00FFFFFFFFFFFFFF {
-		n += 8
-		x <<= 8
-	}
-	if x <= 0x0FFFFFFFFFFFFFFF {
-		n += 4
-		x <<= 4
-	}
-	if x <= 0x3FFFFFFFFFFFFFFF {
-		n += 2
-		x <<= 2
-	}
-	if x <= 0x7FFFFFFFFFFFFFFF {
-		n++
-	}
-	return n
+	return uint8(bits.Len64(v))
 }

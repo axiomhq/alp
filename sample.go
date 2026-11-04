@@ -1,6 +1,8 @@
 package alp
 
-import "math"
+import (
+	"math"
+)
 
 func isSpecial(bits uint64) bool {
 	exponent := bits & 0x7FF0000000000000
@@ -14,21 +16,24 @@ func roundToInt64(value float64) int64 {
 	return int64(value - 0.5)
 }
 
-const maxSamples = 1024
+const (
+	maxSamples = 1024
+	// sampleWindow keeps neighbors together so the cost estimate sees deltas.
+	sampleWindow = 32
+)
 
-// sampleData extracts representative samples from data.
+// sampleData extracts up to maxSamples values as evenly spaced contiguous windows.
 func sampleData(data []float64) []float64 {
 	n := len(data)
 	if n <= maxSamples {
-		result := make([]float64, n)
-		copy(result, data)
-		return result
+		return data
 	}
 
+	windows := maxSamples / sampleWindow
 	result := make([]float64, 0, maxSamples)
-	step := n / maxSamples
-	for i := 0; i < n && len(result) < maxSamples; i += step {
-		result = append(result, data[i])
+	for w := range windows {
+		start := w * (n - sampleWindow) / (windows - 1)
+		result = append(result, data[start:start+sampleWindow]...)
 	}
 	return result
 }
@@ -44,8 +49,8 @@ func findBestParameters(samples []float64) (exp, factor uint8) {
 	bestFactor := uint8(0)
 	bestCost := uint64(1<<63 - 1)
 
-	for candidateExp := uint8(0); candidateExp < numExp; candidateExp++ {
-		for candidateFactor := uint8(0); candidateFactor < numFact; candidateFactor++ {
+	for candidateExp := range uint8(numExp) {
+		for candidateFactor := range uint8(numFact) {
 			cost := estimateCost(samples, candidateExp, candidateFactor)
 			if cost < bestCost {
 				bestCost = cost
@@ -58,16 +63,23 @@ func findBestParameters(samples []float64) (exp, factor uint8) {
 	return bestExp, bestFactor
 }
 
+// estimateCost returns the bits to encode samples with exp and factor, taking
+// the narrower of plain and delta packing. Deltas only span values in one sample window.
 func estimateCost(samples []float64, exp, factor uint8) uint64 {
 	encodeMult := expArr[exp] * fracArr[factor]
 	factMult := float64(factArr[factor])
 	fracMult := fracArr[exp]
 
-	minVal := int64(1<<63 - 1)
-	maxVal := int64(-1 << 63)
+	minVal, maxVal := int64(math.MaxInt64), int64(math.MinInt64)
+	minDelta, maxDelta := int64(math.MaxInt64), int64(math.MinInt64)
 	exceptions := 0
+	var prev int64
+	havePrev := false
 
-	for _, value := range samples {
+	for i, value := range samples {
+		if i%sampleWindow == 0 {
+			havePrev = false
+		}
 		bits := math.Float64bits(value)
 		if isSpecial(bits) {
 			exceptions++
@@ -86,19 +98,22 @@ func estimateCost(samples []float64, exp, factor uint8) uint64 {
 			continue
 		}
 
-		if encoded < minVal {
-			minVal = encoded
+		minVal, maxVal = min(minVal, encoded), max(maxVal, encoded)
+		if havePrev {
+			d := encoded - prev
+			minDelta, maxDelta = min(minDelta, d), max(maxDelta, d)
 		}
-		if encoded > maxVal {
-			maxVal = encoded
-		}
+		prev, havePrev = encoded, true
 	}
 
 	if minVal > maxVal {
 		return uint64(len(samples)) * 64
 	}
 
-	width := bitWidth(uint64(maxVal - minVal))
+	width := bitWidth(uint64(maxVal) - uint64(minVal))
+	if minDelta <= maxDelta {
+		width = min(width, bitWidth(uint64(maxDelta)-uint64(minDelta)))
+	}
 	normalCount := len(samples) - exceptions
 	return uint64(normalCount)*uint64(width) + uint64(exceptions)*64
 }

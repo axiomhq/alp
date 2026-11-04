@@ -2,122 +2,117 @@ package alp
 
 import "math"
 
-// Encode compresses src into dst using s. src must contain exactly VectorSize
-// values.
+// Encode compresses 1 to VectorSize values of src into dst, using delta mode when it packs narrower.
 func Encode(dst *Vector, src []float64, s State) {
-	if len(src) != VectorSize {
-		panic("alp: input must have exactly VectorSize elements")
+	if len(src) == 0 || len(src) > VectorSize {
+		panic("alp: input must have 1 to VectorSize elements")
 	}
 
 	dst.Exp = s.Exp
 	dst.Factor = s.Factor
-	dst.NumExceptions = 0
 
 	encodeMult := expArr[s.Exp] * fracArr[s.Factor]
 	factMult := float64(factArr[s.Factor])
 	fracMult := fracArr[s.Exp]
 
-	minVal := int64(math.MaxInt64)
-	maxVal := int64(math.MinInt64)
 	exceptionCount := uint16(0)
-
-	for i := 0; i < VectorSize; i++ {
-		value := src[i]
+	var first int64
+	haveFirst := false
+	for i, value := range src {
 		bits := math.Float64bits(value)
-
-		// NaN, infinity, and negative zero are always exceptions.
-		exponent := bits & 0x7FF0000000000000
-		if exponent == 0x7FF0000000000000 || bits == 0x8000000000000000 {
+		encoded := int64(0)
+		ok := !isSpecial(bits)
+		if ok {
+			encoded = roundToInt64(value * encodeMult)
+			decoded := float64(encoded) * factMult * fracMult
+			ok = math.Float64bits(decoded) == bits && encoded >= minEncodable && encoded <= maxEncodable
+		}
+		if !ok {
 			dst.ExceptionPos[exceptionCount] = uint16(i)
 			dst.ExceptionBits[exceptionCount] = bits
 			exceptionCount++
-			dst.Encoded[i] = 0
-			continue
+		} else if !haveFirst {
+			first, haveFirst = encoded, true
 		}
-
-		scaled := value * encodeMult
-		var encoded int64
-		if scaled >= 0 {
-			encoded = int64(scaled + 0.5)
-		} else {
-			encoded = int64(scaled - 0.5)
-		}
-
-		decoded := float64(encoded) * factMult * fracMult
-		if math.Float64bits(decoded) != bits || encoded < minEncodable || encoded > maxEncodable {
-			dst.ExceptionPos[exceptionCount] = uint16(i)
-			dst.ExceptionBits[exceptionCount] = bits
-			exceptionCount++
-			dst.Encoded[i] = 0
-			continue
-		}
-
 		dst.Encoded[i] = encoded
-		if encoded < minVal {
-			minVal = encoded
-		}
-		if encoded > maxVal {
-			maxVal = encoded
-		}
 	}
-
 	dst.NumExceptions = exceptionCount
-	if minVal > maxVal {
-		minVal, maxVal = 0, 0
+
+	// Exception and padding slots repeat the previous value so they widen nothing.
+	prev := first
+	next := uint16(0)
+	for i := range dst.Encoded {
+		if i >= len(src) || (next < exceptionCount && dst.ExceptionPos[next] == uint16(i)) {
+			if i < len(src) {
+				next++
+			}
+			dst.Encoded[i] = prev
+			continue
+		}
+		prev = dst.Encoded[i]
 	}
 
-	dst.FrameOfRef = minVal
-	dst.BitWidth = bitWidth(uint64(maxVal - minVal))
+	minVal, maxVal := dst.Encoded[0], dst.Encoded[0]
+	minDelta, maxDelta := dst.Encoded[1]-dst.Encoded[0], dst.Encoded[1]-dst.Encoded[0]
+	for i := 1; i < VectorSize; i++ {
+		v := dst.Encoded[i]
+		minVal, maxVal = min(minVal, v), max(maxVal, v)
+		d := v - dst.Encoded[i-1]
+		minDelta, maxDelta = min(minDelta, d), max(maxDelta, d)
+	}
+	plainWidth := bitWidth(uint64(maxVal) - uint64(minVal))
+	deltaWidth := bitWidth(uint64(maxDelta) - uint64(minDelta))
 
-	for i := 0; i < VectorSize; i++ {
-		dst.Encoded[i] -= minVal
+	dst.Delta = deltaWidth < plainWidth
+	if !dst.Delta {
+		dst.Base = 0
+		dst.FrameOfRef = minVal
+		dst.BitWidth = plainWidth
+		for i := range dst.Encoded {
+			dst.Encoded[i] -= minVal
+		}
+		return
+	}
+	// Deltas wrap on int64 overflow; Decode wraps the same way.
+	dst.Base = dst.Encoded[0]
+	dst.FrameOfRef = minDelta
+	dst.BitWidth = deltaWidth
+	prev = dst.Encoded[0]
+	dst.Encoded[0] = 0
+	for i := 1; i < VectorSize; i++ {
+		v := dst.Encoded[i]
+		dst.Encoded[i] = v - prev - minDelta
+		prev = v
 	}
 }
 
-// Decode decompresses src into dst. dst must contain exactly VectorSize
-// elements.
+// Decode decompresses the first len(dst) values of src; len(dst) must not exceed VectorSize.
 func Decode(dst []float64, src *Vector) {
-	if len(dst) != VectorSize {
-		panic("alp: output must have exactly VectorSize elements")
+	if len(dst) > VectorSize {
+		panic("alp: output must have at most VectorSize elements")
 	}
 
 	factMult := float64(factArr[src.Factor])
 	fracMult := fracArr[src.Exp]
 	frameOfRef := src.FrameOfRef
 
-	if src.NumExceptions == 0 {
-		for i := 0; i < VectorSize; i++ {
+	if src.Delta {
+		v := src.Base
+		for i := range dst {
+			if i > 0 {
+				v += src.Encoded[i] + frameOfRef
+			}
+			dst[i] = float64(v) * factMult * fracMult
+		}
+	} else {
+		for i := range dst {
 			dst[i] = float64(src.Encoded[i]+frameOfRef) * factMult * fracMult
 		}
-		return
 	}
 
-	var exceptionBitmap [VectorSize / 64]uint64
-	for i := uint16(0); i < src.NumExceptions; i++ {
-		position := src.ExceptionPos[i]
-		exceptionBitmap[position/64] |= 1 << (position % 64)
-	}
-
-	exceptionIndex := uint16(0)
-	for word := 0; word < VectorSize/64; word++ {
-		bits := exceptionBitmap[word]
-		base := word * 64
-
-		if bits == 0 {
-			for i := 0; i < 64; i++ {
-				dst[base+i] = float64(src.Encoded[base+i]+frameOfRef) * factMult * fracMult
-			}
-			continue
-		}
-
-		for i := 0; i < 64; i++ {
-			index := base + i
-			if bits&(1<<i) != 0 {
-				dst[index] = math.Float64frombits(src.ExceptionBits[exceptionIndex])
-				exceptionIndex++
-			} else {
-				dst[index] = float64(src.Encoded[index]+frameOfRef) * factMult * fracMult
-			}
+	for i := range src.NumExceptions {
+		if position := int(src.ExceptionPos[i]); position < len(dst) {
+			dst[position] = math.Float64frombits(src.ExceptionBits[i])
 		}
 	}
 }

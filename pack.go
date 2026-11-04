@@ -1,100 +1,114 @@
 package alp
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
 
-const packedHeaderSize = 13
+// ErrCorrupt is returned by Unpack for truncated or invalid input.
+var ErrCorrupt = errors.New("alp: corrupt vector")
 
-// Pack serializes a Vector to bytes.
-//
-// The format is a 13-byte header, bit-packed encoded values, then exceptions.
-// The header contains frame-of-reference (8 bytes), bit width, exponent,
-// factor, and exception count (2 bytes), all in little-endian order.
-func Pack(vector *Vector) []byte {
-	packedBits := VectorSize * int(vector.BitWidth)
-	packedBytes := (packedBits + 7) / 8
-	exceptionBytes := int(vector.NumExceptions) * 10
+const (
+	packedHeaderSize = 13
+	// packedDeltaFlag marks delta mode in the bit-width byte; Base then follows the header.
+	packedDeltaFlag = 0x80
+)
 
-	buffer := make([]byte, packedHeaderSize+packedBytes+exceptionBytes)
+// Pack appends vector to dst as header, delta base, bit-packed values, then exceptions.
+func Pack(dst []byte, vector *Vector) []byte {
+	start := len(dst)
+	dst = append(dst, make([]byte, PackedSize(vector))...)
+	buffer := dst[start:]
 	binary.LittleEndian.PutUint64(buffer[0:8], uint64(vector.FrameOfRef))
 	buffer[8] = vector.BitWidth
 	buffer[9] = vector.Exp
 	buffer[10] = vector.Factor
 	binary.LittleEndian.PutUint16(buffer[11:13], vector.NumExceptions)
-
-	if vector.BitWidth > 0 {
-		packBits(buffer[packedHeaderSize:packedHeaderSize+packedBytes], vector.Encoded[:], vector.BitWidth)
+	offset := packedHeaderSize
+	if vector.Delta {
+		buffer[8] |= packedDeltaFlag
+		binary.LittleEndian.PutUint64(buffer[offset:], uint64(vector.Base))
+		offset += 8
 	}
 
-	exceptionOffset := packedHeaderSize + packedBytes
-	for i := uint16(0); i < vector.NumExceptions; i++ {
-		binary.LittleEndian.PutUint16(buffer[exceptionOffset:], vector.ExceptionPos[i])
-		binary.LittleEndian.PutUint64(buffer[exceptionOffset+2:], vector.ExceptionBits[i])
-		exceptionOffset += 10
-	}
+	packedBytes := (VectorSize*int(vector.BitWidth) + 7) / 8
+	packBits(buffer[offset:offset+packedBytes], vector.Encoded[:], vector.BitWidth)
 
-	return buffer
+	offset += packedBytes
+	for i := range vector.NumExceptions {
+		binary.LittleEndian.PutUint16(buffer[offset:], vector.ExceptionPos[i])
+		binary.LittleEndian.PutUint64(buffer[offset+2:], vector.ExceptionBits[i])
+		offset += 10
+	}
+	return dst
 }
 
-// Unpack deserializes src into dst. If src is incomplete, Unpack decodes all
-// complete fields and leaves unavailable data at its zero value.
-func Unpack(dst *Vector, src []byte) {
-	*dst = Vector{}
+// Unpack reads one Vector from the start of src and returns the bytes consumed.
+// It returns an error wrapping ErrCorrupt on truncated or invalid input.
+func Unpack(dst *Vector, src []byte) (int, error) {
 	if len(src) < packedHeaderSize {
-		return
+		return 0, fmt.Errorf("%w: %d header bytes, want %d", ErrCorrupt, len(src), packedHeaderSize)
 	}
-
 	dst.FrameOfRef = int64(binary.LittleEndian.Uint64(src[0:8]))
-	dst.BitWidth = src[8]
+	dst.Delta = src[8]&packedDeltaFlag != 0
+	dst.BitWidth = src[8] &^ packedDeltaFlag
 	dst.Exp = src[9]
 	dst.Factor = src[10]
 	dst.NumExceptions = binary.LittleEndian.Uint16(src[11:13])
-
-	packedBits := VectorSize * int(dst.BitWidth)
-	packedBytes := (packedBits + 7) / 8
-	if packedBytes > len(src)-packedHeaderSize {
-		return
+	if dst.BitWidth > 64 || dst.Exp >= numExp || dst.Factor >= numFact || dst.NumExceptions > VectorSize {
+		return 0, fmt.Errorf("%w: bit width %d, exp %d, factor %d, exceptions %d", ErrCorrupt, dst.BitWidth, dst.Exp, dst.Factor, dst.NumExceptions)
 	}
 
-	if dst.BitWidth > 0 {
-		unpackBits(dst.Encoded[:], src[packedHeaderSize:packedHeaderSize+packedBytes], dst.BitWidth)
+	size := PackedSize(dst)
+	if len(src) < size {
+		return 0, fmt.Errorf("%w: %d bytes, want %d", ErrCorrupt, len(src), size)
 	}
 
-	exceptionOffset := packedHeaderSize + packedBytes
-	completeExceptions := uint16(0)
-	for completeExceptions < dst.NumExceptions && exceptionOffset+10 <= len(src) {
-		dst.ExceptionPos[completeExceptions] = binary.LittleEndian.Uint16(src[exceptionOffset:])
-		dst.ExceptionBits[completeExceptions] = binary.LittleEndian.Uint64(src[exceptionOffset+2:])
-		completeExceptions++
+	offset := packedHeaderSize
+	dst.Base = 0
+	if dst.Delta {
+		dst.Base = int64(binary.LittleEndian.Uint64(src[offset:]))
+		offset += 8
+	}
+	packedBytes := (VectorSize*int(dst.BitWidth) + 7) / 8
+	unpackBits(dst.Encoded[:], src[offset:offset+packedBytes], dst.BitWidth)
+
+	// Exceptions must ascend so each position is stored once.
+	exceptionOffset := offset + packedBytes
+	for i := range dst.NumExceptions {
+		position := binary.LittleEndian.Uint16(src[exceptionOffset:])
+		if position >= VectorSize || (i > 0 && position <= dst.ExceptionPos[i-1]) {
+			return 0, fmt.Errorf("%w: exception %d at position %d", ErrCorrupt, i, position)
+		}
+		dst.ExceptionPos[i] = position
+		dst.ExceptionBits[i] = binary.LittleEndian.Uint64(src[exceptionOffset+2:])
 		exceptionOffset += 10
 	}
-	dst.NumExceptions = completeExceptions
+	return size, nil
 }
 
 func packBits(dst []byte, src []int64, width uint8) {
-	if width == 0 {
-		return
-	}
-
 	switch width {
 	case 8:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			dst[i] = byte(src[i])
 		}
 		return
 	case 16:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			binary.LittleEndian.PutUint16(dst[i*2:], uint16(src[i]))
 		}
 		return
 	case 32:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			binary.LittleEndian.PutUint32(dst[i*4:], uint32(src[i]))
 		}
 		return
 	}
 
 	bitPosition := uint(0)
-	for i := 0; i < VectorSize; i++ {
+	for i := range VectorSize {
 		value := uint64(src[i])
 		remaining := uint(width)
 		shift := uint(0)
@@ -102,10 +116,7 @@ func packBits(dst []byte, src []int64, width uint8) {
 		for remaining > 0 {
 			byteIndex := bitPosition / 8
 			bitOffset := bitPosition % 8
-			bitsAvailable := 8 - bitOffset
-			if bitsAvailable > remaining {
-				bitsAvailable = remaining
-			}
+			bitsAvailable := min(8-bitOffset, remaining)
 
 			mask := uint64((1 << bitsAvailable) - 1)
 			bits := (value >> shift) & mask
@@ -119,31 +130,26 @@ func packBits(dst []byte, src []int64, width uint8) {
 }
 
 func unpackBits(dst []int64, src []byte, width uint8) {
-	if width == 0 {
-		clear(dst)
-		return
-	}
-
 	switch width {
 	case 8:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			dst[i] = int64(src[i])
 		}
 		return
 	case 16:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			dst[i] = int64(binary.LittleEndian.Uint16(src[i*2:]))
 		}
 		return
 	case 32:
-		for i := 0; i < VectorSize; i++ {
+		for i := range VectorSize {
 			dst[i] = int64(binary.LittleEndian.Uint32(src[i*4:]))
 		}
 		return
 	}
 
 	bitPosition := uint(0)
-	for i := 0; i < VectorSize; i++ {
+	for i := range VectorSize {
 		var value uint64
 		remaining := uint(width)
 		shift := uint(0)
@@ -151,10 +157,7 @@ func unpackBits(dst []int64, src []byte, width uint8) {
 		for remaining > 0 {
 			byteIndex := bitPosition / 8
 			bitOffset := bitPosition % 8
-			bitsAvailable := 8 - bitOffset
-			if bitsAvailable > remaining {
-				bitsAvailable = remaining
-			}
+			bitsAvailable := min(8-bitOffset, remaining)
 
 			mask := byte((1 << bitsAvailable) - 1)
 			bits := (src[byteIndex] >> bitOffset) & mask
@@ -168,10 +171,11 @@ func unpackBits(dst []int64, src []byte, width uint8) {
 	}
 }
 
-// PackedSize returns the number of bytes Pack will produce for vector.
+// PackedSize returns the number of bytes Pack appends for vector.
 func PackedSize(vector *Vector) int {
-	packedBits := VectorSize * int(vector.BitWidth)
-	packedBytes := (packedBits + 7) / 8
-	exceptionBytes := int(vector.NumExceptions) * 10
-	return packedHeaderSize + packedBytes + exceptionBytes
+	size := packedHeaderSize + (VectorSize*int(vector.BitWidth)+7)/8 + int(vector.NumExceptions)*10
+	if vector.Delta {
+		size += 8
+	}
+	return size
 }
