@@ -7,13 +7,14 @@ const VectorSize = 1024
 
 // State holds the encoding parameters learned from sampling.
 type State struct {
-	Exp    uint8 // Exponent: multiply by 10^Exp before rounding
-	Factor uint8 // Factor: divide by 10^Factor after rounding
+	Exp    uint8 // Encode scales by 10^Exp before rounding; Decode divides it back out
+	Factor uint8 // Encode pre-divides by 10^Factor (net scale 10^(Exp-Factor)); Decode multiplies it back; both must be < 18
 }
 
 // Vector is a compressed block of VectorSize float64 values.
 type Vector struct {
 	// Encoded contains the integers after ALP transformation.
+	// A Vector is about 18KB: reuse one and pass it by pointer.
 	Encoded [VectorSize]int64
 
 	// FrameOfRef is the minimum value (or delta, in delta mode) subtracted for bit-packing.
@@ -36,7 +37,8 @@ type Vector struct {
 	ExceptionBits [VectorSize]uint64
 }
 
-// Sample analyzes data to find encoding parameters.
+// Sample picks encoding parameters from at most 1,024 values of data, taken as
+// evenly spaced windows. The State may be reused for any block of similar values.
 func Sample(data []float64) State {
 	if len(data) == 0 {
 		return State{}

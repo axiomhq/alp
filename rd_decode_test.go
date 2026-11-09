@@ -19,7 +19,7 @@ func TestDecodeRD48(t *testing.T) {
 			rightParts := make([]byte, n*6)
 			want := make([]float64, n)
 			for i := 0; i < n; i++ {
-				code := uint16(i>>1) & 1
+				code := uint16(i*7+i>>3) & 1
 				leftCodes[i>>3] |= byte(code) << (i & 7)
 				right := uint64(i) * 0x9e3779b97f4a & (uint64(1)<<48 - 1)
 				offset := i * 6

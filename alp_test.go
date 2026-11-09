@@ -1,6 +1,7 @@
 package alp
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"math/rand"
@@ -8,11 +9,7 @@ import (
 )
 
 func TestEncodeDecode(t *testing.T) {
-	random := rand.New(rand.NewSource(42))
-	source := make([]float64, VectorSize)
-	for i := range source {
-		source[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	source := randomDecimals(42, VectorSize)
 
 	state := Sample(source)
 	var encoded Vector
@@ -52,11 +49,7 @@ func TestEncodeDecodeSpecialValues(t *testing.T) {
 }
 
 func TestPackUnpack(t *testing.T) {
-	random := rand.New(rand.NewSource(42))
-	source := make([]float64, VectorSize)
-	for i := range source {
-		source[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	source := randomDecimals(42, VectorSize)
 
 	state := Sample(source)
 	var encoded Vector
@@ -166,17 +159,13 @@ func FuzzUnpack(f *testing.F) {
 }
 
 func TestCompressionRatio(t *testing.T) {
-	random := rand.New(rand.NewSource(42))
-	source := make([]float64, VectorSize)
-	for i := range source {
-		source[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	source := randomDecimals(42, VectorSize)
 
 	var encoded Vector
 	Encode(&encoded, source, Sample(source))
 	ratio := float64(PackedSize(&encoded)) / float64(VectorSize*8)
-	if ratio > 0.6 {
-		t.Fatalf("compression ratio %.2f%% exceeds 60%%", ratio*100)
+	if ratio > 0.35 {
+		t.Fatalf("compression ratio %.2f%% exceeds 35%%", ratio*100)
 	}
 }
 
@@ -191,11 +180,7 @@ func TestDeltaMode(t *testing.T) {
 	for i := range ramp {
 		ramp[i] = 1000 + float64(i)*0.25
 	}
-	noisy := make([]float64, VectorSize)
-	random := rand.New(rand.NewSource(1))
-	for i := range noisy {
-		noisy[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	noisy := randomDecimals(1, VectorSize)
 	// Exception and padding slots repeat the previous value: a ramp of step 25 gets deltas in {0, 25, 50}, 6 bits against 15 plain.
 	withNaN := append([]float64(nil), ramp...)
 	withNaN[0], withNaN[500], withNaN[VectorSize-1] = math.NaN(), math.NaN(), math.Inf(1)
@@ -233,6 +218,16 @@ func TestDeltaMode(t *testing.T) {
 	}
 }
 
+// randomDecimals returns n deterministic values with two decimal places.
+func randomDecimals(seed int64, n int) []float64 {
+	random := rand.New(rand.NewSource(seed))
+	values := make([]float64, n)
+	for i := range values {
+		values[i] = float64(random.Intn(1_000_000)) / 100
+	}
+	return values
+}
+
 func assertEqualBits(t *testing.T, want, got []float64) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -248,11 +243,9 @@ func assertEqualBits(t *testing.T, want, got []float64) {
 }
 
 func FuzzEncodeDecode(f *testing.F) {
-	f.Add(int64(42), uint8(0))
-	f.Add(int64(7), uint8(1))
-	f.Add(int64(99), uint8(2))
-	f.Add(int64(5), uint8(3))
-	f.Add(int64(6), uint8(4))
+	for pattern := range uint8(5) {
+		f.Add(int64(42), pattern)
+	}
 
 	f.Fuzz(func(t *testing.T, seed int64, pattern uint8) {
 		random := rand.New(rand.NewSource(seed))
@@ -260,16 +253,16 @@ func FuzzEncodeDecode(f *testing.F) {
 		step := float64(random.Intn(1000)) / 100
 		for i := range source {
 			switch pattern % 5 {
-			case 3:
-				source[i] = float64(i) * step
-			case 4:
-				source[i] = []float64{math.NaN(), 1e18, -1e18, 0.5}[random.Intn(4)]
-			case 0:
+			case 0: // two-decimal values
 				source[i] = float64(random.Intn(1_000_000)) / 100
-			case 1:
+			case 1: // random magnitudes
 				source[i] = random.Float64() * math.Pow10(random.Intn(20)-10)
-			case 2:
+			case 2: // arbitrary bit patterns
 				source[i] = math.Float64frombits(random.Uint64())
+			case 3: // ramp
+				source[i] = float64(i) * step
+			case 4: // NaN and out-of-range values
+				source[i] = []float64{math.NaN(), 1e18, -1e18, 0.5}[random.Intn(4)]
 			}
 		}
 
@@ -287,11 +280,7 @@ func FuzzEncodeDecode(f *testing.F) {
 }
 
 func BenchmarkEncode(b *testing.B) {
-	random := rand.New(rand.NewSource(42))
-	source := make([]float64, VectorSize)
-	for i := range source {
-		source[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	source := randomDecimals(42, VectorSize)
 	state := Sample(source)
 	var vector Vector
 
@@ -302,11 +291,7 @@ func BenchmarkEncode(b *testing.B) {
 }
 
 func BenchmarkDecode(b *testing.B) {
-	random := rand.New(rand.NewSource(42))
-	source := make([]float64, VectorSize)
-	for i := range source {
-		source[i] = float64(random.Intn(1_000_000)) / 100
-	}
+	source := randomDecimals(42, VectorSize)
 	var vector Vector
 	Encode(&vector, source, Sample(source))
 	destination := make([]float64, VectorSize)
@@ -315,4 +300,62 @@ func BenchmarkDecode(b *testing.B) {
 	for b.Loop() {
 		Decode(destination, &vector)
 	}
+}
+
+// naivePack is the original bit-at-a-time layout, kept as the wire-format reference.
+func naivePack(src []int64, width uint) []byte {
+	out := make([]byte, (VectorSize*int(width)+7)/8)
+	pos := uint(0)
+	for _, s := range src {
+		for b := range width {
+			if uint64(s)>>b&1 != 0 {
+				out[pos/8] |= 1 << (pos % 8)
+			}
+			pos++
+		}
+	}
+	return out
+}
+
+func TestPackBitsAllWidths(t *testing.T) {
+	random := rand.New(rand.NewSource(3))
+	for width := uint(0); width <= 64; width++ {
+		src := make([]int64, VectorSize)
+		for i := range src {
+			src[i] = int64(random.Uint64() & (^uint64(0) >> (64 - max(width, 1))))
+			if width == 0 {
+				src[i] = 0
+			}
+		}
+		want := naivePack(src, width)
+		got := make([]byte, len(want))
+		packBits(got, src, uint8(width))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("width %d: packed bytes differ from reference layout", width)
+		}
+		back := make([]int64, VectorSize)
+		for i := range back {
+			back[i] = -1
+		}
+		unpackBits(back, got, uint8(width))
+		for i := range src {
+			if back[i] != src[i] {
+				t.Fatalf("width %d value %d = %d, want %d", width, i, back[i], src[i])
+			}
+		}
+	}
+}
+
+func TestNegativeAndPartialDecode(t *testing.T) {
+	source := []float64{-1.25, -3.5, -0.01, 7.75, math.NaN(), -0.5, math.Inf(-1), 2}
+	var encoded Vector
+	Encode(&encoded, source, Sample(source))
+	decoded := make([]float64, len(source))
+	Decode(decoded, &encoded)
+	assertEqualBits(t, source, decoded)
+
+	// Decoding a shorter prefix must ignore exceptions beyond it.
+	short := make([]float64, 4)
+	Decode(short, &encoded)
+	assertEqualBits(t, source[:4], short)
 }

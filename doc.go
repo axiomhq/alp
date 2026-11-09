@@ -9,7 +9,13 @@
 // Usage: Sample a column once to get a State, then Encode each block of
 // VectorSize values into a Vector and Pack it. Unpack and Decode reverse this.
 // Unpack validates its input and returns an error on truncated or corrupt
-// data, so Decode never reads out of bounds.
+// data, so Decode never reads out of bounds on a Vector it filled. Encode,
+// Decode and Pack may panic or emit undecodable bytes for a hand-built
+// Vector or State with out-of-range fields. A packed vector stores no value count or length index: store the
+// count of a short block and the offset of each vector yourself.
+//
+// DecodeRD48 is a standalone decoder for one ALP-RD layout; this package has
+// no ALP-RD encoder.
 //
 // The packed layout is stored by consumers, so changes to it must stay
 // readable by existing decoders.
