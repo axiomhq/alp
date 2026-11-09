@@ -8,7 +8,9 @@ import (
 
 // DecodeRD48 decodes the common ALP-RD layout with two 16-bit prefixes and
 // one packed 48-bit suffix per value. Each bit in leftCodes selects one of the
-// prefixes; rightParts stores six little-endian bytes per value.
+// prefixes, LSB first within each byte, as the high 16 bits of the value;
+// rightParts stores the low 48 bits as six little-endian bytes per value.
+// dst must not overlap rightParts.
 //
 // DecodeRD48 panics if leftCodes or rightParts are too short for dst.
 func DecodeRD48(dst []float64, leftCodes, rightParts []byte, prefixes [2]uint16) {
